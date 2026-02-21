@@ -1,0 +1,38 @@
+{
+  "configurations" : [
+    {
+      "id" : "CA2BE47F-83DE-4F41-9E1D-EF2E3D61AFCA",
+      "name" : "Test Scheme Action",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "performanceAntipatternCheckerEnabled" : true,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:DSAMAC.xcodeproj",
+      "identifier" : "768BB6A42F4A5127007436BF",
+      "name" : "DSAMAC"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:DSAMAC.xcodeproj",
+        "identifier" : "768BB6B62F4A5128007436BF",
+        "name" : "DSAMACTests"
+      }
+    },
+    {
+      "parallelizable" : true,
+      "target" : {
+        "containerPath" : "container:DSAMAC.xcodeproj",
+        "identifier" : "768BB6C02F4A5128007436BF",
+        "name" : "DSAMACUITests"
+      }
+    }
+  ],
+  "version" : 1
+}
