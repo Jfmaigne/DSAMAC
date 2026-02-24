@@ -27,6 +27,7 @@
 		768BB6A52F4A5127007436BF /* DSAMAC.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DSAMAC.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		768BB6B72F4A5128007436BF /* DSAMACTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DSAMACTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		768BB6C12F4A5128007436BF /* DSAMACUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DSAMACUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		76CEAA3A2F4E400C006CAFF4 /* DSAMAC.xctestplan */ = {isa = PBXFileReference; lastKnownFileType = text; path = DSAMAC.xctestplan; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -75,6 +76,7 @@
 		768BB69C2F4A5127007436BF = {
 			isa = PBXGroup;
 			children = (
+				76CEAA3A2F4E400C006CAFF4 /* DSAMAC.xctestplan */,
 				768BB6A72F4A5127007436BF /* DSAMAC */,
 				768BB6BA2F4A5128007436BF /* DSAMACTests */,
 				768BB6C42F4A5128007436BF /* DSAMACUITests */,
