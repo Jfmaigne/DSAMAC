@@ -3,10 +3,13 @@ import Combine
 
 @MainActor
 final class DirectoryDomainService: ObservableObject {
-    private let connector: DirectoryConnector
+    public var connector: DirectoryConnector
 
     @Published var rootOUTree: [OUNode] = []
     @Published var currentObjects: [DirectoryObjectSummary] = []
+    @Published var allUsers: [UserDescriptor] = []
+    @Published var allGroups: [GroupDescriptor] = []
+    @Published var allComputers: [ComputerDescriptor] = []
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
 
@@ -15,12 +18,22 @@ final class DirectoryDomainService: ObservableObject {
     }
 
     func loadTree() {
+        isLoading = true
+        errorMessage = nil
+        
         do {
             let ous = try connector.fetchOUTree()
             self.rootOUTree = OUNode.buildTree(from: ous)
+            
+            // Charger tous les objets en cache
+            self.allUsers = try connector.fetchAllUsers()
+            self.allGroups = try connector.fetchAllGroups()
+            self.allComputers = try connector.fetchAllComputers()
         } catch {
             self.errorMessage = error.localizedDescription
         }
+        
+        isLoading = false
     }
 
     func selectContainer(_ selection: DirectoryContainerSelection?) {
@@ -31,7 +44,7 @@ final class DirectoryDomainService: ObservableObject {
 
         do {
             let result = try connector.fetchObjects(in: ouID)
-            currentObjects = DirectoryObjectSummary.from(users: result.users, groups: result.groups)
+            currentObjects = DirectoryObjectSummary.from(users: result.users, groups: result.groups, computers: result.computers)
         } catch {
             self.errorMessage = error.localizedDescription
         }
@@ -40,11 +53,9 @@ final class DirectoryDomainService: ObservableObject {
     func search(_ query: String) {
         do {
             if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                // Pas de recherche globale : on laisse la vue gérer l'affichage courant
                 return
             }
             let results = try connector.searchObjects(query: query)
-            // On convertit les résultats en summaries pour la liste
             self.currentObjects = results.map { result in
                 switch result.kind {
                 case .user:
@@ -65,6 +76,24 @@ final class DirectoryDomainService: ObservableObject {
                         isDisabled: false,
                         isLocked: false
                     )
+                case .computer:
+                    return DirectoryObjectSummary(
+                        id: result.id,
+                        kind: .computer,
+                        primaryText: result.displayName,
+                        secondaryText: result.secondaryText,
+                        isDisabled: false,
+                        isLocked: false
+                    )
+                case .ou:
+                    return DirectoryObjectSummary(
+                        id: result.id,
+                        kind: .user, // fallback
+                        primaryText: result.displayName,
+                        secondaryText: result.secondaryText,
+                        isDisabled: false,
+                        isLocked: false
+                    )
                 }
             }
         } catch {
@@ -72,47 +101,42 @@ final class DirectoryDomainService: ObservableObject {
         }
     }
 
-    func details(for selection: DirectoryObjectSelection?) -> (user: UserDescriptor?, group: GroupDescriptor?) {
-        guard let selection else { return (nil, nil) }
+    func details(for selection: DirectoryObjectSelection?) -> (user: UserDescriptor?, group: GroupDescriptor?, computer: ComputerDescriptor?) {
+        guard let selection else { return (nil, nil, nil) }
+        
         switch selection {
         case .user(let id):
-            if let user = try? connector.searchObjects(query: "").compactMap({ result -> UserDescriptor? in
-                return nil
-            }) {
-                _ = user
+            if let user = allUsers.first(where: { $0.id == id }) {
+                return (user, nil, nil)
             }
-            // Pour l'instant, on recherche simplement dans les objets chargés du dernier conteneur
-            if case let .user(userID) = selection {
-                if let summaryUser = currentObjects.first(where: { $0.id == userID && $0.kind == .user }) {
-                    // On n'a pas tous les champs détaillés, mais on peut renvoyer une vue simplifiée via le summary
-                    let descriptor = UserDescriptor(
-                        id: summaryUser.id,
-                        username: summaryUser.primaryText,
-                        displayName: summaryUser.primaryText,
-                        email: summaryUser.secondaryText,
-                        phone: nil,
-                        department: nil,
-                        descriptionText: nil,
-                        isEnabled: !summaryUser.isDisabled,
-                        isLocked: summaryUser.isLocked,
-                        ouID: UUID()
-                    )
-                    return (descriptor, nil)
-                }
+            if let user = try? connector.fetchUserDetails(id: id) {
+                return (user, nil, nil)
             }
+            return (nil, nil, nil)
+            
         case .group(let id):
-            if let summaryGroup = currentObjects.first(where: { $0.id == id && $0.kind == .group }) {
-                let descriptor = GroupDescriptor(
-                    id: summaryGroup.id,
-                    name: summaryGroup.primaryText,
-                    descriptionText: summaryGroup.secondaryText,
-                    ouID: UUID(),
-                    memberUserIDs: []
-                )
-                return (nil, descriptor)
+            if let group = allGroups.first(where: { $0.id == id }) {
+                return (nil, group, nil)
             }
+            if let group = try? connector.fetchGroupDetails(id: id) {
+                return (nil, group, nil)
+            }
+            return (nil, nil, nil)
+            
+        case .computer(let id):
+            if let computer = allComputers.first(where: { $0.id == id }) {
+                return (nil, nil, computer)
+            }
+            if let computer = try? connector.fetchComputerDetails(id: id) {
+                return (nil, nil, computer)
+            }
+            return (nil, nil, nil)
         }
-        return (nil, nil)
+    }
+    
+    func setConnector(_ newConnector: DirectoryConnector) {
+        self.connector = newConnector
+        loadTree()
     }
 }
 
@@ -121,7 +145,7 @@ final class DirectoryDomainService: ObservableObject {
 struct OUNode: Identifiable, Hashable {
     let id: OUDescriptor.ID
     let name: String
-    let children: [OUNode]? // optionnel pour être compatible avec OutlineGroup
+    let children: [OUNode]?
 }
 
 extension OUNode {
@@ -130,7 +154,8 @@ extension OUNode {
         func build(parentID: OUDescriptor.ID?) -> [OUNode] {
             let children = byParent[parentID] ?? []
             return children.map { ou in
-                OUNode(id: ou.id, name: ou.name, children: build(parentID: ou.id))
+                let subChildren = build(parentID: ou.id)
+                return OUNode(id: ou.id, name: ou.name, children: subChildren.isEmpty ? nil : subChildren)
             }
         }
         return build(parentID: nil)
@@ -141,6 +166,7 @@ struct DirectoryObjectSummary: Identifiable, Hashable {
     enum Kind: Hashable {
         case user
         case group
+        case computer
     }
 
     let id: UUID
@@ -152,13 +178,13 @@ struct DirectoryObjectSummary: Identifiable, Hashable {
 }
 
 extension DirectoryObjectSummary {
-    static func from(users: [UserDescriptor], groups: [GroupDescriptor]) -> [DirectoryObjectSummary] {
+    static func from(users: [UserDescriptor], groups: [GroupDescriptor], computers: [ComputerDescriptor]) -> [DirectoryObjectSummary] {
         let userSummaries = users.map { user in
             DirectoryObjectSummary(
                 id: user.id,
                 kind: .user,
-                primaryText: user.displayName.isEmpty ? user.username : user.displayName,
-                secondaryText: user.email,
+                primaryText: user.fullName,
+                secondaryText: user.userPrincipalName ?? user.sAMAccountName,
                 isDisabled: !user.isEnabled,
                 isLocked: user.isLocked
             )
@@ -169,13 +195,24 @@ extension DirectoryObjectSummary {
                 id: group.id,
                 kind: .group,
                 primaryText: group.name,
-                secondaryText: group.descriptionText,
+                secondaryText: "\(group.groupScope.rawValue) - \(group.groupType.rawValue)",
                 isDisabled: false,
                 isLocked: false
             )
         }
+        
+        let computerSummaries = computers.map { computer in
+            DirectoryObjectSummary(
+                id: computer.id,
+                kind: .computer,
+                primaryText: computer.displayName,
+                secondaryText: computer.osInfo,
+                isDisabled: !computer.isEnabled,
+                isLocked: false
+            )
+        }
 
-        return userSummaries + groupSummaries
+        return userSummaries + groupSummaries + computerSummaries
     }
 }
 
@@ -186,4 +223,5 @@ enum DirectoryContainerSelection: Hashable {
 enum DirectoryObjectSelection: Hashable {
     case user(UUID)
     case group(UUID)
+    case computer(UUID)
 }

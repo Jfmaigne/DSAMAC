@@ -7,15 +7,29 @@ struct DirectoryRootView: View {
     @State private var selectedObject: DirectoryObjectSelection?
 
     var body: some View {
-        NavigationSplitView {
-            DirectorySidebarView(domainService: domainService, selectedContainer: $selectedContainer)
-        } content: {
-            DirectoryObjectListView(domainService: domainService, containerSelection: selectedContainer, selectedObject: $selectedObject)
-        } detail: {
-            DirectoryObjectDetailView(domainService: domainService, objectSelection: selectedObject)
-        }
-        .task {
-            domainService.loadTree()
+        VStack {
+            HStack {
+                Button("Utiliser AD réel") {
+                    domainService.setConnector(ActiveDirectoryConnector())
+                }
+                .buttonStyle(.bordered)
+                .padding(.top)
+                Spacer()
+            }
+            if let adConnector = domainService.connector as? ActiveDirectoryConnector, adConnector.needsManualConfig {
+                LDAPConfigView(connector: adConnector)
+            } else {
+                NavigationSplitView {
+                    DirectorySidebarView(domainService: domainService, selectedContainer: $selectedContainer)
+                } content: {
+                    DirectoryObjectListView(domainService: domainService, containerSelection: selectedContainer, selectedObject: $selectedObject)
+                } detail: {
+                    DirectoryObjectDetailView(domainService: domainService, objectSelection: selectedObject)
+                }
+                .task {
+                    domainService.loadTree()
+                }
+            }
         }
     }
 }
