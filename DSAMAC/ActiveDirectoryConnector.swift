@@ -143,10 +143,10 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         guard !hasFetched else { return }
         
         if shouldUseLDAP() {
-            // TODO: Implémenter la lecture LDAP ici
-            // Utiliser ldapConfig pour se connecter et charger les objets
-            // Charger les OUs, utilisateurs, groupes, ordinateurs via LDAP
-            throw NSError(domain: "AD", code: 2, userInfo: [NSLocalizedDescriptionKey: "Lecture LDAP non encore implémentée."])
+            guard let cfg = ldapConfig else {
+                throw NSError(domain: "AD", code: 2, userInfo: [NSLocalizedDescriptionKey: "Configuration LDAP manquante."])
+            }
+            try loadViaLDAP(config: cfg)
         } else {
             do {
                 let nodePath = try detectADNode()
@@ -615,6 +615,354 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         )
     }
     
+    // MARK: - Implémentation LDAP via ldapsearch
+
+    private func loadViaLDAP(config: LDAPConfig) throws {
+        // Calculer la base DN depuis le domaine (ex: example.local -> DC=example,DC=local)
+        let baseDN = domainToBaseDN(config.domain)
+
+        // Créer les OUs virtuelles
+        rootOUID = UUID()
+        let rootOU = OUDescriptor(id: rootOUID, name: config.domain, parentID: nil,
+                                  distinguishedName: baseDN, description: "Domaine Active Directory",
+                                  whenCreated: nil, whenChanged: nil)
+
+        let usersOUID = UUID()
+        let usersOU = OUDescriptor(id: usersOUID, name: "Utilisateurs", parentID: rootOUID,
+                                   distinguishedName: "CN=Users,\(baseDN)", description: "Utilisateurs du domaine",
+                                   whenCreated: nil, whenChanged: nil)
+
+        let groupsOUID = UUID()
+        let groupsOU = OUDescriptor(id: groupsOUID, name: "Groupes", parentID: rootOUID,
+                                    distinguishedName: "CN=Groups,\(baseDN)", description: "Groupes du domaine",
+                                    whenCreated: nil, whenChanged: nil)
+
+        let computersOUID = UUID()
+        let computersOU = OUDescriptor(id: computersOUID, name: "Ordinateurs", parentID: rootOUID,
+                                       distinguishedName: "CN=Computers,\(baseDN)", description: "Ordinateurs du domaine",
+                                       whenCreated: nil, whenChanged: nil)
+
+        // Charger les vraies OUs depuis LDAP
+        let realOUs = try ldapFetchOUs(config: config, baseDN: baseDN, parentID: rootOUID)
+        cachedOUs = [rootOU, usersOU, groupsOU, computersOU] + realOUs
+
+        // Charger les utilisateurs
+        cachedUsers = try ldapFetchUsers(config: config, baseDN: baseDN, ouID: usersOUID)
+
+        // Charger les groupes
+        cachedGroups = try ldapFetchGroups(config: config, baseDN: baseDN, ouID: groupsOUID)
+
+        // Charger les ordinateurs
+        cachedComputers = try ldapFetchComputers(config: config, baseDN: baseDN, ouID: computersOUID)
+    }
+
+    /// Convertit "example.local" en "DC=example,DC=local"
+    private func domainToBaseDN(_ domain: String) -> String {
+        return domain.split(separator: ".")
+            .map { "DC=\($0)" }
+            .joined(separator: ",")
+    }
+
+    // MARK: - Fetch OUs via LDAP
+
+    private func ldapFetchOUs(config: LDAPConfig, baseDN: String, parentID: UUID) throws -> [OUDescriptor] {
+        let filter = "(objectClass=organizationalUnit)"
+        let attrs = ["ou", "distinguishedName", "description", "whenCreated", "whenChanged"]
+        let entries = try runLDAPSearch(config: config, baseDN: baseDN, filter: filter, attributes: attrs)
+
+        return entries.compactMap { entry -> OUDescriptor? in
+            guard let dn = entry["dn"]?.first, let name = entry["ou"]?.first else { return nil }
+            return OUDescriptor(
+                id: UUID(),
+                name: name,
+                parentID: parentID,
+                distinguishedName: dn,
+                description: entry["description"]?.first,
+                whenCreated: parseGeneralizedTime(entry["whenCreated"]?.first),
+                whenChanged: parseGeneralizedTime(entry["whenChanged"]?.first)
+            )
+        }.sorted { $0.name < $1.name }
+    }
+
+    // MARK: - Fetch Utilisateurs via LDAP
+
+    private func ldapFetchUsers(config: LDAPConfig, baseDN: String, ouID: UUID) throws -> [UserDescriptor] {
+        let filter = "(&(objectClass=user)(objectCategory=person)(!(objectClass=computer)))"
+        let attrs = [
+            "givenName", "sn", "displayName", "description", "physicalDeliveryOfficeName",
+            "telephoneNumber", "mail", "wWWHomePage", "streetAddress", "postOfficeBox",
+            "l", "st", "postalCode", "co", "c", "sAMAccountName", "userPrincipalName",
+            "objectSid", "userAccountControl", "lockoutTime", "accountExpires", "pwdLastSet",
+            "lastLogon", "lastLogonTimestamp", "logonCount", "badPwdCount", "badPasswordTime",
+            "profilePath", "scriptPath", "homeDirectory", "homeDrive", "homePhone", "pager",
+            "mobile", "facsimileTelephoneNumber", "ipPhone", "title", "department", "company",
+            "manager", "directReports", "memberOf", "primaryGroupID", "distinguishedName",
+            "objectGUID", "whenCreated", "whenChanged", "objectClass"
+        ]
+        let entries = try runLDAPSearch(config: config, baseDN: baseDN, filter: filter, attributes: attrs)
+
+        return entries.compactMap { entry -> UserDescriptor? in
+            guard let sam = entry["sAMAccountName"]?.first else { return nil }
+
+            let uac = entry["userAccountControl"]?.first.flatMap { Int($0) }
+            let isEnabled = !(uac.map { $0 & 0x0002 != 0 } ?? false)
+            let isLocked = entry["lockoutTime"]?.first.map { $0 != "0" && $0 != "" } ?? false
+            let pwdLastSet = parseADDate(entry["pwdLastSet"]?.first)
+            let memberOf = entry["memberOf"] ?? []
+
+            return UserDescriptor(
+                id: UUID(),
+                firstName: entry["givenName"]?.first,
+                lastName: entry["sn"]?.first,
+                displayName: entry["displayName"]?.first ?? sam,
+                description: entry["description"]?.first,
+                office: entry["physicalDeliveryOfficeName"]?.first,
+                telephone: entry["telephoneNumber"]?.first,
+                email: entry["mail"]?.first,
+                webPage: entry["wWWHomePage"]?.first,
+                street: entry["streetAddress"]?.first,
+                poBox: entry["postOfficeBox"]?.first,
+                city: entry["l"]?.first,
+                state: entry["st"]?.first,
+                postalCode: entry["postalCode"]?.first,
+                country: entry["co"]?.first ?? entry["c"]?.first,
+                sAMAccountName: sam,
+                userPrincipalName: entry["userPrincipalName"]?.first,
+                objectSID: entry["objectSid"]?.first,
+                userAccountControl: uac,
+                isEnabled: isEnabled,
+                isLocked: isLocked,
+                accountExpires: parseADDate(entry["accountExpires"]?.first),
+                passwordLastSet: pwdLastSet,
+                passwordNeverExpires: uac.map { $0 & 0x10000 != 0 } ?? false,
+                mustChangePassword: entry["pwdLastSet"]?.first == "0",
+                cannotChangePassword: uac.map { $0 & 0x0040 != 0 } ?? false,
+                lastLogon: parseADDate(entry["lastLogon"]?.first) ?? parseADDate(entry["lastLogonTimestamp"]?.first),
+                logonCount: entry["logonCount"]?.first.flatMap { Int($0) },
+                badPasswordCount: entry["badPwdCount"]?.first.flatMap { Int($0) },
+                badPasswordTime: parseADDate(entry["badPasswordTime"]?.first),
+                profilePath: entry["profilePath"]?.first,
+                scriptPath: entry["scriptPath"]?.first,
+                homeDirectory: entry["homeDirectory"]?.first,
+                homeDrive: entry["homeDrive"]?.first,
+                homePhone: entry["homePhone"]?.first,
+                pager: entry["pager"]?.first,
+                mobile: entry["mobile"]?.first,
+                fax: entry["facsimileTelephoneNumber"]?.first,
+                ipPhone: entry["ipPhone"]?.first,
+                title: entry["title"]?.first,
+                department: entry["department"]?.first,
+                company: entry["company"]?.first,
+                manager: entry["manager"]?.first,
+                managerDisplayName: entry["manager"]?.first.flatMap { extractCNFromDN($0) },
+                directReports: entry["directReports"] ?? [],
+                memberOf: memberOf,
+                primaryGroupID: entry["primaryGroupID"]?.first.flatMap { Int($0) },
+                primaryGroup: nil,
+                distinguishedName: entry["dn"]?.first,
+                objectGUID: entry["objectGUID"]?.first,
+                whenCreated: parseGeneralizedTime(entry["whenCreated"]?.first),
+                whenChanged: parseGeneralizedTime(entry["whenChanged"]?.first),
+                objectClass: entry["objectClass"] ?? [],
+                ouID: ouID
+            )
+        }.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    // MARK: - Fetch Groupes via LDAP
+
+    private func ldapFetchGroups(config: LDAPConfig, baseDN: String, ouID: UUID) throws -> [GroupDescriptor] {
+        let filter = "(objectClass=group)"
+        let attrs = [
+            "cn", "sAMAccountName", "description", "mail", "info",
+            "groupType", "objectSid", "distinguishedName", "objectGUID",
+            "member", "memberOf", "whenCreated", "whenChanged", "managedBy"
+        ]
+        let entries = try runLDAPSearch(config: config, baseDN: baseDN, filter: filter, attributes: attrs)
+
+        return entries.compactMap { entry -> GroupDescriptor? in
+            guard let name = entry["cn"]?.first ?? entry["sAMAccountName"]?.first else { return nil }
+            let sam = entry["sAMAccountName"]?.first ?? name
+            let gtVal = entry["groupType"]?.first.flatMap { Int($0) } ?? 0
+            let members = entry["member"] ?? []
+
+            return GroupDescriptor(
+                id: UUID(),
+                name: name,
+                sAMAccountName: sam,
+                description: entry["description"]?.first,
+                email: entry["mail"]?.first,
+                notes: entry["info"]?.first,
+                groupType: GroupType(fromGroupType: gtVal),
+                groupScope: GroupScope(fromGroupType: gtVal),
+                objectSID: entry["objectSid"]?.first,
+                distinguishedName: entry["dn"]?.first,
+                objectGUID: entry["objectGUID"]?.first,
+                members: members,
+                memberNames: members.compactMap { extractCNFromDN($0) },
+                memberCount: members.count,
+                memberOf: entry["memberOf"] ?? [],
+                memberOfNames: (entry["memberOf"] ?? []).compactMap { extractCNFromDN($0) },
+                whenCreated: parseGeneralizedTime(entry["whenCreated"]?.first),
+                whenChanged: parseGeneralizedTime(entry["whenChanged"]?.first),
+                managedBy: entry["managedBy"]?.first,
+                managedByName: entry["managedBy"]?.first.flatMap { extractCNFromDN($0) },
+                ouID: ouID
+            )
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    // MARK: - Fetch Ordinateurs via LDAP
+
+    private func ldapFetchComputers(config: LDAPConfig, baseDN: String, ouID: UUID) throws -> [ComputerDescriptor] {
+        let filter = "(objectClass=computer)"
+        let attrs = [
+            "cn", "sAMAccountName", "dNSHostName", "description", "location",
+            "operatingSystem", "operatingSystemVersion", "operatingSystemServicePack",
+            "objectSid", "userAccountControl", "accountExpires", "lastLogon",
+            "lastLogonTimestamp", "logonCount", "badPwdCount", "badPasswordTime",
+            "pwdLastSet", "memberOf", "primaryGroupID", "managedBy",
+            "distinguishedName", "objectGUID", "whenCreated", "whenChanged", "objectClass"
+        ]
+        let entries = try runLDAPSearch(config: config, baseDN: baseDN, filter: filter, attributes: attrs)
+
+        return entries.compactMap { entry -> ComputerDescriptor? in
+            guard let name = entry["cn"]?.first else { return nil }
+            let sam = entry["sAMAccountName"]?.first ?? "\(name)$"
+            let uac = entry["userAccountControl"]?.first.flatMap { Int($0) }
+            let isEnabled = !(uac.map { $0 & 0x0002 != 0 } ?? false)
+            let os = entry["operatingSystem"]?.first
+            let memberOf = entry["memberOf"] ?? []
+
+            return ComputerDescriptor(
+                id: UUID(),
+                name: name,
+                sAMAccountName: sam,
+                dnsHostName: entry["dNSHostName"]?.first,
+                description: entry["description"]?.first,
+                location: entry["location"]?.first,
+                computerType: ComputerType(fromOS: os, userAccountControl: uac),
+                operatingSystem: os,
+                operatingSystemVersion: entry["operatingSystemVersion"]?.first,
+                operatingSystemServicePack: entry["operatingSystemServicePack"]?.first,
+                objectSID: entry["objectSid"]?.first,
+                userAccountControl: uac,
+                isEnabled: isEnabled,
+                accountExpires: parseADDate(entry["accountExpires"]?.first),
+                lastLogon: parseADDate(entry["lastLogon"]?.first) ?? parseADDate(entry["lastLogonTimestamp"]?.first),
+                logonCount: entry["logonCount"]?.first.flatMap { Int($0) },
+                badPasswordCount: entry["badPwdCount"]?.first.flatMap { Int($0) },
+                badPasswordTime: parseADDate(entry["badPasswordTime"]?.first),
+                passwordLastSet: parseADDate(entry["pwdLastSet"]?.first),
+                isTrustedForDelegation: uac.map { $0 & 0x80000 != 0 } ?? false,
+                memberOf: memberOf,
+                memberOfNames: memberOf.compactMap { extractCNFromDN($0) },
+                primaryGroupID: entry["primaryGroupID"]?.first.flatMap { Int($0) },
+                primaryGroup: nil,
+                managedBy: entry["managedBy"]?.first,
+                managedByName: entry["managedBy"]?.first.flatMap { extractCNFromDN($0) },
+                distinguishedName: entry["dn"]?.first,
+                objectGUID: entry["objectGUID"]?.first,
+                whenCreated: parseGeneralizedTime(entry["whenCreated"]?.first),
+                whenChanged: parseGeneralizedTime(entry["whenChanged"]?.first),
+                objectClass: entry["objectClass"] ?? [],
+                ouID: ouID
+            )
+        }.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    // MARK: - Exécution de ldapsearch
+
+    /// Exécute ldapsearch et retourne une liste de dictionnaires d'attributs LDAP
+    private func runLDAPSearch(config: LDAPConfig, baseDN: String, filter: String, attributes: [String]) throws -> [[String: [String]]] {
+        // Construire les arguments ldapsearch
+        // ldapsearch -H ldap://server -D "user@domain" -w "password" -b "baseDN" -x "(filter)" attr1 attr2 ...
+        var args: [String] = [
+            "-H", "ldap://\(config.server)",
+            "-D", config.username.contains("@") ? config.username : "\(config.username)@\(config.domain)",
+            "-w", config.password,
+            "-b", baseDN,
+            "-x",          // simple auth (pas SASL)
+            "-LLL",        // sortie LDIF minimale (sans commentaires)
+            "-o", "ldif-wrap=no",  // pas de retour à la ligne dans les valeurs
+            filter
+        ]
+        args += attributes
+
+        let output = try runProcess("/usr/bin/ldapsearch", arguments: args)
+        return parseLDIF(output)
+    }
+
+    /// Parser le format LDIF retourné par ldapsearch
+    private func parseLDIF(_ ldif: String) -> [[String: [String]]] {
+        var results: [[String: [String]]] = []
+        var current: [String: [String]] = [:]
+        var currentKey: String?
+        var currentValue: String = ""
+
+        func flushKeyValue() {
+            guard let key = currentKey, !currentValue.isEmpty else { return }
+            let k = key.lowercased()
+            if current[k] == nil { current[k] = [] }
+            current[k]!.append(currentValue)
+            currentKey = nil
+            currentValue = ""
+        }
+
+        func flushEntry() {
+            flushKeyValue()
+            if !current.isEmpty {
+                results.append(current)
+                current = [:]
+            }
+        }
+
+        for line in ldif.components(separatedBy: "\n") {
+            // Ligne vide = séparateur d'entrée
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                flushEntry()
+                continue
+            }
+
+            // Continuation d'une valeur multi-ligne (commence par espace ou tabulation)
+            if line.hasPrefix(" ") || line.hasPrefix("\t") {
+                currentValue += line.trimmingCharacters(in: .whitespaces)
+                continue
+            }
+
+            // Nouvelle clé: valeur
+            if let colonIdx = line.firstIndex(of: ":") {
+                flushKeyValue()
+                let key = String(line[..<colonIdx])
+                var value = String(line[line.index(after: colonIdx)...])
+
+                // Valeur base64 (:: indique du base64)
+                if value.hasPrefix(": ") {
+                    let b64 = String(value.dropFirst(2))
+                    if let data = Data(base64Encoded: b64),
+                       let decoded = String(data: data, encoding: .utf8) {
+                        value = decoded
+                    } else {
+                        value = b64
+                    }
+                } else {
+                    value = value.hasPrefix(" ") ? String(value.dropFirst()) : value
+                }
+
+                // La ligne "dn:" donne le DN de l'entrée
+                if key.lowercased() == "dn" {
+                    currentKey = "dn"
+                    currentValue = value
+                } else {
+                    currentKey = key
+                    currentValue = value
+                }
+            }
+        }
+        flushEntry()
+        return results
+    }
+
     // MARK: - Helpers dscl
     
     private func readAllAttributes(at path: String) throws -> [String: [String]] {
@@ -681,28 +1029,32 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
     }
     
     private func runDSCL(_ arguments: [String]) throws -> String {
+        return try runProcess("/usr/bin/dscl", arguments: arguments)
+    }
+
+    private func runProcess(_ executable: String, arguments: [String]) throws -> String {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/dscl")
+        process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        
+
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
-        
+
         try process.run()
         process.waitUntilExit()
-        
+
         let dataOut = stdout.fileHandleForReading.readDataToEndOfFile()
         let dataErr = stderr.fileHandleForReading.readDataToEndOfFile()
         let out = String(data: dataOut, encoding: .utf8) ?? ""
         let err = String(data: dataErr, encoding: .utf8) ?? ""
-        
+
         if process.terminationStatus == 0 {
             return out
         } else {
-            throw NSError(domain: "DSCL", code: Int(process.terminationStatus), userInfo: [
-                NSLocalizedDescriptionKey: err.isEmpty ? "dscl failed with status \(process.terminationStatus)" : err
+            throw NSError(domain: "Process", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: err.isEmpty ? "\(executable) a échoué (code \(process.terminationStatus))" : err
             ])
         }
     }
