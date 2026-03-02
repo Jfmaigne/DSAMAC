@@ -1,20 +1,128 @@
 import Foundation
 import Combine
 
-/// Implémentation lecture seule de DirectoryConnector qui interroge un domaine AD réel via l'outil `dscl`.
-///
-/// Cette implémentation suppose que le Mac est joint à un domaine Active Directory.
-/// Elle lit tous les attributs utilisateurs, groupes et ordinateurs comme le ferait dsa.msc.
+// MARK: - Méthode de connexion AD
+
+/// Les différentes méthodes de connexion sécurisée à un domaine Active Directory
+enum ADConnectionMethod: String, CaseIterable, Identifiable {
+    /// LDAP Simple Bind en clair – NON RECOMMANDÉ (port 389, aucun chiffrement)
+    case simpleBind     = "LDAP Simple (non sécurisé)"
+    /// LDAPS : TLS natif dès la connexion (port 636) – RECOMMANDÉ
+    case ldaps          = "LDAPS (TLS natif, port 636)"
+    /// StartTLS : connexion LDAP puis upgrade TLS (port 389) – RECOMMANDÉ
+    case startTLS       = "StartTLS (port 389 + TLS)"
+    /// Kerberos / GSSAPI : authentification Windows intégrée, sans mot de passe exposé
+    case kerberos       = "Kerberos / GSSAPI (SSO)"
+
+    var id: String { rawValue }
+
+    /// Port par défaut selon la méthode
+    var defaultPort: Int {
+        switch self {
+        case .simpleBind, .startTLS: return 389
+        case .ldaps:                 return 636
+        case .kerberos:              return 389
+        }
+    }
+
+    /// Description de sécurité
+    var securityDescription: String {
+        switch self {
+        case .simpleBind:
+            return "⚠️ Credentials envoyés en clair. À éviter absolument en production."
+        case .ldaps:
+            return "✅ TLS natif depuis la connexion. Recommandé pour les environnements AD."
+        case .startTLS:
+            return "✅ Connexion LDAP puis upgrade TLS automatique. Compatible avec la plupart des AD."
+        case .kerberos:
+            return "✅ Authentification SSO Windows. Aucun mot de passe transmis sur le réseau."
+        }
+    }
+}
+
+// MARK: - Configuration LDAP enrichie
+
+struct ADConnectionConfig {
+    // Connexion
+    var server: String
+    var port: Int
+    var domain: String
+    var method: ADConnectionMethod
+
+    // Credentials (non utilisés en mode Kerberos)
+    var username: String
+    var password: String
+
+    // Options TLS (LDAPS / StartTLS)
+    /// Ignorer les erreurs de certificat (auto-signé, etc.) – à n'activer qu'en dev/test
+    var ignoreCertificateErrors: Bool
+    /// Chemin vers un certificat CA personnalisé (PEM) – optionnel
+    var caCertificatePath: String?
+
+    // Kerberos
+    /// Principal Kerberos explicite (ex: admin@EXAMPLE.LOCAL) – optionnel, sinon ticket courant
+    var kerberosPrincipal: String?
+
+    init(
+        server: String,
+        domain: String,
+        method: ADConnectionMethod = .ldaps,
+        username: String = "",
+        password: String = "",
+        port: Int? = nil,
+        ignoreCertificateErrors: Bool = false,
+        caCertificatePath: String? = nil,
+        kerberosPrincipal: String? = nil
+    ) {
+        self.server = server
+        self.domain = domain
+        self.method = method
+        self.username = username
+        self.password = password
+        self.port = port ?? method.defaultPort
+        self.ignoreCertificateErrors = ignoreCertificateErrors
+        self.caCertificatePath = caCertificatePath
+        self.kerberosPrincipal = kerberosPrincipal
+    }
+}
+
+// MARK: - Connecteur AD
+
+/// Implémentation lecture seule de DirectoryConnector qui interroge un domaine AD réel.
+/// Supporte LDAPS, StartTLS, Kerberos/GSSAPI et (à éviter) Simple Bind.
+/// Si le Mac est joint au domaine, utilise dscl automatiquement.
 final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
-    // Configuration LDAP
+
+    // Rétrocompatibilité : accès à la config via l'ancienne propriété
     struct LDAPConfig {
         let server: String
         let domain: String
         let username: String
         let password: String
     }
-    
-    public var ldapConfig: LDAPConfig?
+
+    /// Config complète (méthode sécurisée + credentials)
+    public var adConfig: ADConnectionConfig?
+
+    /// Rétrocompatibilité
+    public var ldapConfig: LDAPConfig? {
+        get {
+            guard let cfg = adConfig else { return nil }
+            return LDAPConfig(server: cfg.server, domain: cfg.domain,
+                              username: cfg.username, password: cfg.password)
+        }
+        set {
+            if let lc = newValue {
+                adConfig = ADConnectionConfig(
+                    server: lc.server, domain: lc.domain,
+                    method: .ldaps,
+                    username: lc.username, password: lc.password
+                )
+            } else {
+                adConfig = nil
+            }
+        }
+    }
     
     // MARK: - Cache et état
     
@@ -141,12 +249,9 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
     
     private func ensureDataFetched() throws {
         guard !hasFetched else { return }
-        
-        if shouldUseLDAP() {
-            guard let cfg = ldapConfig else {
-                throw NSError(domain: "AD", code: 2, userInfo: [NSLocalizedDescriptionKey: "Configuration LDAP manquante."])
-            }
-            try loadViaLDAP(config: cfg)
+
+        if let cfg = adConfig {
+            try loadViaADConfig(cfg)
         } else {
             do {
                 let nodePath = try detectADNode()
@@ -615,15 +720,14 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         )
     }
     
-    // MARK: - Implémentation LDAP via ldapsearch
+    // MARK: - Chargement via configuration AD (LDAPS / StartTLS / Kerberos / SimpleBind)
 
-    private func loadViaLDAP(config: LDAPConfig) throws {
-        // Calculer la base DN depuis le domaine (ex: example.local -> DC=example,DC=local)
-        let baseDN = domainToBaseDN(config.domain)
+    private func loadViaADConfig(_ cfg: ADConnectionConfig) throws {
+        let baseDN = domainToBaseDN(cfg.domain)
 
-        // Créer les OUs virtuelles
+        // Créer les OUs virtuelles racine
         rootOUID = UUID()
-        let rootOU = OUDescriptor(id: rootOUID, name: config.domain, parentID: nil,
+        let rootOU = OUDescriptor(id: rootOUID, name: cfg.domain, parentID: nil,
                                   distinguishedName: baseDN, description: "Domaine Active Directory",
                                   whenCreated: nil, whenChanged: nil)
 
@@ -643,17 +747,23 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
                                        whenCreated: nil, whenChanged: nil)
 
         // Charger les vraies OUs depuis LDAP
-        let realOUs = try ldapFetchOUs(config: config, baseDN: baseDN, parentID: rootOUID)
+        let realOUs = (try? ldapFetchOUs(config: cfg, baseDN: baseDN, parentID: rootOUID)) ?? []
         cachedOUs = [rootOU, usersOU, groupsOU, computersOU] + realOUs
 
-        // Charger les utilisateurs
-        cachedUsers = try ldapFetchUsers(config: config, baseDN: baseDN, ouID: usersOUID)
+        // Charger les objets
+        cachedUsers     = try ldapFetchUsers(config: cfg, baseDN: baseDN, ouID: usersOUID)
+        cachedGroups    = try ldapFetchGroups(config: cfg, baseDN: baseDN, ouID: groupsOUID)
+        cachedComputers = try ldapFetchComputers(config: cfg, baseDN: baseDN, ouID: computersOUID)
+    }
 
-        // Charger les groupes
-        cachedGroups = try ldapFetchGroups(config: config, baseDN: baseDN, ouID: groupsOUID)
-
-        // Charger les ordinateurs
-        cachedComputers = try ldapFetchComputers(config: config, baseDN: baseDN, ouID: computersOUID)
+    // Rétrocompat : ancienne méthode appelée via l'ancien LDAPConfig
+    private func loadViaLDAP(config: LDAPConfig) throws {
+        let cfg = ADConnectionConfig(
+            server: config.server, domain: config.domain,
+            method: .ldaps,
+            username: config.username, password: config.password
+        )
+        try loadViaADConfig(cfg)
     }
 
     /// Convertit "example.local" en "DC=example,DC=local"
@@ -665,7 +775,7 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
 
     // MARK: - Fetch OUs via LDAP
 
-    private func ldapFetchOUs(config: LDAPConfig, baseDN: String, parentID: UUID) throws -> [OUDescriptor] {
+    private func ldapFetchOUs(config: ADConnectionConfig, baseDN: String, parentID: UUID) throws -> [OUDescriptor] {
         let filter = "(objectClass=organizationalUnit)"
         let attrs = ["ou", "distinguishedName", "description", "whenCreated", "whenChanged"]
         let entries = try runLDAPSearch(config: config, baseDN: baseDN, filter: filter, attributes: attrs)
@@ -686,7 +796,7 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
 
     // MARK: - Fetch Utilisateurs via LDAP
 
-    private func ldapFetchUsers(config: LDAPConfig, baseDN: String, ouID: UUID) throws -> [UserDescriptor] {
+    private func ldapFetchUsers(config: ADConnectionConfig, baseDN: String, ouID: UUID) throws -> [UserDescriptor] {
         let filter = "(&(objectClass=user)(objectCategory=person)(!(objectClass=computer)))"
         let attrs = [
             "givenName", "sn", "displayName", "description", "physicalDeliveryOfficeName",
@@ -771,7 +881,7 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
 
     // MARK: - Fetch Groupes via LDAP
 
-    private func ldapFetchGroups(config: LDAPConfig, baseDN: String, ouID: UUID) throws -> [GroupDescriptor] {
+    private func ldapFetchGroups(config: ADConnectionConfig, baseDN: String, ouID: UUID) throws -> [GroupDescriptor] {
         let filter = "(objectClass=group)"
         let attrs = [
             "cn", "sAMAccountName", "description", "mail", "info",
@@ -814,7 +924,7 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
 
     // MARK: - Fetch Ordinateurs via LDAP
 
-    private func ldapFetchComputers(config: LDAPConfig, baseDN: String, ouID: UUID) throws -> [ComputerDescriptor] {
+    private func ldapFetchComputers(config: ADConnectionConfig, baseDN: String, ouID: UUID) throws -> [ComputerDescriptor] {
         let filter = "(objectClass=computer)"
         let attrs = [
             "cn", "sAMAccountName", "dNSHostName", "description", "location",
@@ -871,26 +981,126 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         }.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
-    // MARK: - Exécution de ldapsearch
+    // MARK: - Exécution de ldapsearch (LDAPS / StartTLS / Kerberos / SimpleBind)
 
-    /// Exécute ldapsearch et retourne une liste de dictionnaires d'attributs LDAP
-    private func runLDAPSearch(config: LDAPConfig, baseDN: String, filter: String, attributes: [String]) throws -> [[String: [String]]] {
-        // Construire les arguments ldapsearch
-        // ldapsearch -H ldap://server -D "user@domain" -w "password" -b "baseDN" -x "(filter)" attr1 attr2 ...
-        var args: [String] = [
-            "-H", "ldap://\(config.server)",
-            "-D", config.username.contains("@") ? config.username : "\(config.username)@\(config.domain)",
-            "-w", config.password,
+    /// Construit et exécute ldapsearch selon la méthode de connexion choisie.
+    /// - LDAPS       : -H ldaps://server:636
+    /// - StartTLS    : -H ldap://server:389 -ZZ
+    /// - Kerberos    : -H ldap://server -Y GSSAPI  (pas de -D/-w)
+    /// - SimpleBind  : -H ldap://server -x -D user -w pass  (NON RECOMMANDÉ)
+    private func runLDAPSearch(config: ADConnectionConfig, baseDN: String, filter: String, attributes: [String]) throws -> [[String: [String]]] {
+
+        var args: [String] = []
+
+        // ── URL de connexion ──────────────────────────────────────────────────
+        let port = config.port
+        switch config.method {
+        case .ldaps:
+            args += ["-H", "ldaps://\(config.server):\(port)"]
+        case .startTLS, .simpleBind, .kerberos:
+            args += ["-H", "ldap://\(config.server):\(port)"]
+        }
+
+        // ── Gestion des certificats TLS ───────────────────────────────────────
+        // ldapsearch utilise les variables d'environnement LDAPTLS_* ou le fichier ldaprc
+        // On les passe via l'environnement du Process (voir runLDAPProcess)
+
+        // ── StartTLS : upgrade de connexion en TLS ───────────────────────────
+        if config.method == .startTLS {
+            args += ["-ZZ"]   // -ZZ = StartTLS obligatoire (échoue si non supporté)
+        }
+
+        // ── Authentification ─────────────────────────────────────────────────
+        switch config.method {
+        case .kerberos:
+            // GSSAPI : le ticket Kerberos courant est utilisé (kinit préalable si besoin)
+            args += ["-Y", "GSSAPI"]
+            if let principal = config.kerberosPrincipal, !principal.isEmpty {
+                args += ["-U", principal]
+            }
+
+        case .ldaps, .startTLS:
+            // Simple Bind mais sur canal chiffré → acceptable
+            let bindDN = config.username.contains("@")
+                ? config.username
+                : "\(config.username)@\(config.domain)"
+            args += ["-x", "-D", bindDN, "-w", config.password]
+
+        case .simpleBind:
+            // Simple Bind en clair – déconseillé mais gardé pour compatibilité
+            let bindDN = config.username.contains("@")
+                ? config.username
+                : "\(config.username)@\(config.domain)"
+            args += ["-x", "-D", bindDN, "-w", config.password]
+        }
+
+        // ── Requête LDAP ──────────────────────────────────────────────────────
+        args += [
             "-b", baseDN,
-            "-x",          // simple auth (pas SASL)
-            "-LLL",        // sortie LDIF minimale (sans commentaires)
+            "-LLL",             // LDIF v1 sans commentaires
             "-o", "ldif-wrap=no",  // pas de retour à la ligne dans les valeurs
             filter
         ]
         args += attributes
 
-        let output = try runProcess("/usr/bin/ldapsearch", arguments: args)
+        let output = try runLDAPProcess(config: config, arguments: args)
         return parseLDIF(output)
+    }
+
+    /// Lance /usr/bin/ldapsearch avec les bonnes variables d'environnement TLS
+    private func runLDAPProcess(config: ADConnectionConfig, arguments: [String]) throws -> String {
+        var env = ProcessInfo.processInfo.environment
+
+        // Variables d'environnement OpenLDAP pour la gestion des certificats
+        if config.ignoreCertificateErrors {
+            // Désactiver la vérification du certificat serveur (dev/test uniquement)
+            env["LDAPTLS_REQCERT"] = "never"
+        } else if let caPath = config.caCertificatePath, !caPath.isEmpty {
+            // Utiliser un CA personnalisé
+            env["LDAPTLS_CACERT"] = caPath
+            env["LDAPTLS_REQCERT"] = "demand"
+        } else {
+            // Comportement par défaut : vérification stricte
+            env["LDAPTLS_REQCERT"] = "demand"
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ldapsearch")
+        process.arguments = arguments
+        process.environment = env
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError  = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        let dataOut = stdout.fileHandleForReading.readDataToEndOfFile()
+        let dataErr = stderr.fileHandleForReading.readDataToEndOfFile()
+        let out = String(data: dataOut, encoding: .utf8) ?? ""
+        let err = String(data: dataErr, encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            // Analyser le message d'erreur pour donner un retour précis
+            let msg: String
+            if err.contains("Can't contact LDAP server") {
+                msg = "Impossible de contacter le serveur \(config.server):\(config.port). Vérifiez l'adresse et le port."
+            } else if err.contains("Invalid credentials") {
+                msg = "Identifiants incorrects. Vérifiez le nom d'utilisateur et le mot de passe."
+            } else if err.contains("certificate") || err.contains("TLS") {
+                msg = "Erreur de certificat TLS. Activez 'Ignorer les erreurs de certificat' pour un serveur avec certificat auto-signé."
+            } else if err.contains("GSSAPI") || err.contains("Kerberos") {
+                msg = "Erreur Kerberos/GSSAPI. Vérifiez que vous avez un ticket Kerberos valide (kinit)."
+            } else {
+                msg = err.isEmpty ? "ldapsearch a échoué (code \(process.terminationStatus))" : err
+            }
+            throw NSError(domain: "LDAP", code: Int(process.terminationStatus),
+                          userInfo: [NSLocalizedDescriptionKey: msg])
+        }
+
+        return out
     }
 
     /// Parser le format LDIF retourné par ldapsearch
@@ -1109,13 +1319,19 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         return nil
     }
     
-    // Ajout d'un initialiseur pour configurer le connecteur
-    init(ldapConfig: LDAPConfig? = nil) {
-        self.ldapConfig = ldapConfig
+    // MARK: - Initialisation
+
+    init(adConfig: ADConnectionConfig? = nil) {
+        self.adConfig = adConfig
     }
-    
-    // Méthode utilitaire pour savoir si on doit utiliser dscl ou LDAP
-    private func shouldUseLDAP() -> Bool {
-        return ldapConfig != nil
+
+    /// Réinitialise le cache pour forcer un rechargement complet au prochain fetch
+    func resetCache() {
+        hasFetched = false
+        cachedUsers = []
+        cachedGroups = []
+        cachedComputers = []
+        cachedOUs = []
+        adNodePath = nil
     }
 }
