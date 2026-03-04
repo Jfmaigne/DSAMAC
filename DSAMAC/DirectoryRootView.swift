@@ -7,28 +7,30 @@ struct DirectoryRootView: View {
     @State private var selectedObject: DirectoryObjectSelection?
 
     var body: some View {
-        VStack {
-            HStack {
-                Button("Utiliser AD réel") {
-                    domainService.setConnector(ActiveDirectoryConnector())
+        NavigationSplitView {
+            DirectorySidebarView(domainService: domainService, selectedContainer: $selectedContainer)
+        } content: {
+            DirectoryObjectListView(domainService: domainService, containerSelection: selectedContainer, selectedObject: $selectedObject)
+        } detail: {
+            DirectoryObjectDetailView(domainService: domainService, objectSelection: selectedObject)
+        }
+        .task {
+            domainService.loadTree()
+        }
+        // Afficher l'erreur éventuelle
+        .overlay {
+            if let error = domainService.errorMessage {
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.largeTitle)
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.bordered)
-                .padding(.top)
-                Spacer()
-            }
-            if let adConnector = domainService.connector as? ActiveDirectoryConnector, adConnector.needsManualConfig {
-                LDAPConfigView(connector: adConnector)
-            } else {
-                NavigationSplitView {
-                    DirectorySidebarView(domainService: domainService, selectedContainer: $selectedContainer)
-                } content: {
-                    DirectoryObjectListView(domainService: domainService, containerSelection: selectedContainer, selectedObject: $selectedObject)
-                } detail: {
-                    DirectoryObjectDetailView(domainService: domainService, objectSelection: selectedObject)
-                }
-                .task {
-                    domainService.loadTree()
-                }
+                .padding()
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .padding()
             }
         }
     }

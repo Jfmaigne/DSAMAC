@@ -2,6 +2,8 @@ import SwiftUI
 
 struct LDAPConfigView: View {
     @ObservedObject var connector: ActiveDirectoryConnector
+    /// Le service de domaine, pour recharger l'arbre après connexion réussie
+    @ObservedObject var domainService: DirectoryDomainService
 
     // Champs de connexion
     @State private var server: String = ""
@@ -222,14 +224,24 @@ struct LDAPConfigView: View {
             kerberosPrincipal: kerberosPrincipal.isEmpty ? nil : kerberosPrincipal
         )
 
-        // Capturer le connecteur explicitement
+        // 1. Configurer le connecteur
+        connector.adConfig = cfg
+        connector.resetCache()
+
+        // 2. Lancer la connexion en tâche de fond
         let conn = connector
+        let svc = domainService
         Task {
             do {
-                conn.adConfig = cfg
-                conn.needsManualConfig = false
-                conn.resetCache()
+                // Tenter de charger les données — cela appelle ldapsearch
                 _ = try conn.fetchOUTree()
+
+                // Succès → la config manuelle n'est plus nécessaire
+                conn.needsManualConfig = false
+
+                // Recharger le service complet (arbre + objets)
+                svc.loadTree()
+
                 isConnecting = false
             } catch {
                 isConnecting = false
@@ -243,7 +255,10 @@ struct LDAPConfigView: View {
 #if DEBUG
 struct LDAPConfigView_Previews: PreviewProvider {
     static var previews: some View {
-        LDAPConfigView(connector: ActiveDirectoryConnector(adConfig: nil))
+        LDAPConfigView(
+            connector: ActiveDirectoryConnector(adConfig: nil),
+            domainService: DirectoryDomainService(connector: LocalCoreDataConnector(context: PersistenceController.shared.container.viewContext))
+        )
     }
 }
 #endif

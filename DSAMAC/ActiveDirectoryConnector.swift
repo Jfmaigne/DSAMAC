@@ -1112,9 +1112,9 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
 
         func flushKeyValue() {
             guard let key = currentKey, !currentValue.isEmpty else { return }
-            let k = key.lowercased()
-            if current[k] == nil { current[k] = [] }
-            current[k]!.append(currentValue)
+            // Garder la casse originale de la clé LDAP (ex: sAMAccountName, givenName...)
+            if current[key] == nil { current[key] = [] }
+            current[key]!.append(currentValue)
             currentKey = nil
             currentValue = ""
         }
