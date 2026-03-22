@@ -895,11 +895,31 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
     // MARK: - Vérification du ticket Kerberos
 
     /// Vérifie qu'un ticket Kerberos valide existe dans le cache.
+    /// Tente plusieurs stratégies : cache par défaut, API: (Ticket Viewer macOS), -A (tous les caches).
     /// Retourne le principal du ticket courant, ou nil si aucun ticket valide n'est trouvé.
     static func checkKerberosTicket() -> String? {
+        // Stratégies de détection dans l'ordre de priorité
+        let strategies: [(label: String, arguments: [String])] = [
+            ("cache par défaut",  []),
+            ("Ticket Viewer API:", ["--cache=API:"]),
+            ("tous les caches",   ["-A"]),
+            ("liste des caches",  ["-l"]),
+        ]
+
+        for strategy in strategies {
+            if let principal = runKlistAndExtractPrincipal(arguments: strategy.arguments) {
+                return principal
+            }
+        }
+
+        return nil
+    }
+
+    /// Lance klist avec les arguments donnés et extrait le principal de la sortie
+    private static func runKlistAndExtractPrincipal(arguments: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/klist")
-        process.arguments = ["-s"]  // -s = mode silencieux, code retour seulement
+        process.arguments = arguments
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -915,31 +935,23 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
 
         guard process.terminationStatus == 0 else { return nil }
 
-        // Récupérer le principal avec klist (mode verbose)
-        let detailProcess = Process()
-        detailProcess.executableURL = URL(fileURLWithPath: "/usr/bin/klist")
-        let detailOut = Pipe()
-        detailProcess.standardOutput = detailOut
-        detailProcess.standardError = Pipe()
-
-        do {
-            try detailProcess.run()
-            detailProcess.waitUntilExit()
-        } catch {
-            return nil
-        }
-
-        let data = detailOut.fileHandleForReading.readDataToEndOfFile()
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
 
-        // Chercher la ligne "Default principal: user@REALM"
-        for line in output.split(separator: "\n") {
+        // Chercher le principal dans la sortie
+        // Heimdal (macOS) : "Principal: user@REALM"
+        // MIT Kerberos    : "Default principal: user@REALM"
+        let prefixes = ["default principal:", "principal:"]
+        for line in output.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.lowercased().hasPrefix("default principal:") {
-                let principal = trimmed
-                    .replacingOccurrences(of: "Default principal:", with: "", options: .caseInsensitive)
-                    .trimmingCharacters(in: .whitespaces)
-                return principal.isEmpty ? nil : principal
+            for prefix in prefixes {
+                if trimmed.lowercased().hasPrefix(prefix) {
+                    let principal = String(trimmed.dropFirst(prefix.count))
+                        .trimmingCharacters(in: .whitespaces)
+                    if !principal.isEmpty {
+                        return principal
+                    }
+                }
             }
         }
 

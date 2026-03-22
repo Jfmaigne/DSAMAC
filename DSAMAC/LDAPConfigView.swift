@@ -1,4 +1,4 @@
-import SwiftUI
+    import SwiftUI
 
 struct LDAPConfigView: View {
     @ObservedObject var connector: ActiveDirectoryConnector
@@ -41,6 +41,7 @@ struct LDAPConfigView: View {
     @State private var showAdvanced: Bool = false
     @State private var showKerberosAdvanced: Bool = false
     @State private var showLDAPAdvanced: Bool = false
+    @State private var showDiagnostic: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -279,6 +280,17 @@ struct LDAPConfigView: View {
                                 }
                             }
                         }
+
+                        // Bouton diagnostic
+                        Button {
+                            showDiagnostic = true
+                        } label: {
+                            Label("Lancer le diagnostic complet…", systemImage: "stethoscope")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .padding(.top, 4)
+
                     } header: {
                         Text("Kerberos / GSSAPI")
                     } footer: {
@@ -394,6 +406,9 @@ struct LDAPConfigView: View {
         .onAppear {
             // Vérifier le ticket Kerberos au chargement
             kerberosTicketPrincipal = ActiveDirectoryConnector.checkKerberosTicket()
+        }
+        .sheet(isPresented: $showDiagnostic) {
+            KerberosDiagnosticView(domain: domain, server: server)
         }
     }
 
