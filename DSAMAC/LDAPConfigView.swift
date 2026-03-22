@@ -29,7 +29,7 @@ struct LDAPConfigView: View {
     @State private var globalCatalogPort: String = ""
 
     // ── Options avancées ────────────────────────────────────────────────
-    @State private var autoDetectServer: Bool = false
+    @State private var autoDetectServer: Bool = true
     @State private var connectionTimeout: String = "30"
     @State private var sizeLimit: String = "0"
     @State private var followReferrals: Bool = true
@@ -82,6 +82,10 @@ struct LDAPConfigView: View {
                         let oldDefaults = ADConnectionMethod.allCases.map { $0.defaultPort }
                         if oldDefaults.contains(currentPort) || port.isEmpty {
                             port = "\(newMethod.defaultPort)"
+                        }
+                        // En mode Kerberos, activer l'auto-détection par défaut
+                        if newMethod == .kerberos && server.isEmpty {
+                            autoDetectServer = true
                         }
                     }
 
@@ -359,28 +363,32 @@ struct LDAPConfigView: View {
                         .padding(.vertical, 4)
                     }
                 }
+
+                // ═══════════════════════════════════════════════════════════════
+                // Bouton de connexion (dans le formulaire pour rester visible)
+                // ═══════════════════════════════════════════════════════════════
+                Section {
+                    HStack {
+                        Spacer()
+                        Button(action: connect) {
+                            HStack(spacing: 8) {
+                                if isConnecting {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                                Text(isConnecting ? "Connexion en cours…" : "Se connecter")
+                                    .fontWeight(.semibold)
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .disabled(isConnecting || !isFormValid)
+                        .keyboardShortcut(.return)
+                        Spacer()
+                    }
+                }
             }
             .formStyle(.grouped)
-
-            Divider()
-
-            // ── Bouton de connexion ───────────────────────────────────────────
-            HStack {
-                Spacer()
-                Button(action: connect) {
-                    if isConnecting {
-                        ProgressView()
-                            .controlSize(.small)
-                            .padding(.trailing, 6)
-                    }
-                    Text(isConnecting ? "Connexion en cours…" : "Se connecter")
-                        .fontWeight(.semibold)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(isConnecting || !isFormValid)
-                .keyboardShortcut(.return)
-                .padding()
-            }
         }
         .frame(minWidth: 600, minHeight: 580)
         .onAppear {
@@ -392,10 +400,21 @@ struct LDAPConfigView: View {
     // MARK: - Helpers
 
     private var isFormValid: Bool {
-        guard !domain.isEmpty else { return false }
-        if !autoDetectServer && server.isEmpty { return false }
-        if method == .kerberos { return true }
-        return !username.isEmpty && !password.isEmpty
+        // Le domaine est toujours obligatoire
+        if domain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return false
+        }
+        // Le serveur est obligatoire sauf si auto-détection est activée
+        if !autoDetectServer && server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return false
+        }
+        // En Kerberos, seul le domaine (+ serveur ou auto-detect) est requis
+        if method == .kerberos {
+            return true
+        }
+        // Pour les autres méthodes, username + password sont obligatoires
+        return !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !password.isEmpty
     }
 
     private var securityIcon: String {
