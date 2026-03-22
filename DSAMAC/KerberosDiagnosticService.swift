@@ -64,37 +64,8 @@ final class KerberosDiagnosticService: ObservableObject {
         // Tout se fait en tâche de fond pour ne pas bloquer l'UI
         let dom = domain
         let srv = server
-        Task.detached { [weak self] in
-            var allEntries: [DiagnosticEntry] = []
-
-            // 1. Informations système
-            allEntries += Self.diagnoseSystem()
-
-            // 2. Variables d'environnement Kerberos
-            allEntries += Self.diagnoseEnvironment()
-
-            // 3. Configuration Kerberos (krb5.conf)
-            allEntries += Self.diagnoseKerberosConfig()
-
-            // 4. Tickets Kerberos (klist avec toutes les variantes)
-            allEntries += Self.diagnoseKerberosTickets()
-
-            // 5. DNS SRV pour le domaine
-            if !dom.isEmpty {
-                allEntries += Self.diagnoseDNS(domain: dom)
-            }
-
-            // 6. Connectivité réseau vers le serveur
-            if !srv.isEmpty {
-                allEntries += Self.diagnoseNetwork(server: srv, domain: dom)
-            } else if !dom.isEmpty {
-                allEntries += Self.diagnoseNetwork(server: "", domain: dom)
-            }
-
-            // 7. Test ldapsearch basique
-            if !dom.isEmpty {
-                allEntries += Self.diagnoseLDAP(domain: dom, server: srv)
-            }
+        Task.detached {
+            let allEntries = KerberosDiagnosticRunner.runAll(domain: dom, server: srv)
 
             // Résumé
             let errors = allEntries.filter { $0.status == .error }.count
@@ -102,7 +73,7 @@ final class KerberosDiagnosticService: ObservableObject {
             let successes = allEntries.filter { $0.status == .success }.count
             let summaryText = "✅ \(successes)  ⚠️ \(warnings)  ❌ \(errors)  —  \(allEntries.count) vérifications effectuées"
 
-            await MainActor.run {
+            await MainActor.run { [weak self] in
                 self?.entries = allEntries
                 self?.summary = summaryText
                 self?.isRunning = false
@@ -141,7 +112,6 @@ final class KerberosDiagnosticService: ObservableObject {
             }
             lines.append("\(icon) \(entry.title)")
             if !entry.detail.isEmpty {
-                // Indenter chaque ligne du détail
                 for detailLine in entry.detail.components(separatedBy: "\n") {
                     lines.append("    \(detailLine)")
                 }
@@ -154,6 +124,38 @@ final class KerberosDiagnosticService: ObservableObject {
         lines.append("═══════════════════════════════════════════════════════════")
 
         return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - Moteur de diagnostic (non isolé au MainActor)
+
+/// Toutes les méthodes de diagnostic sont regroupées ici, hors du MainActor,
+/// pour pouvoir être appelées depuis un Task.detached sans conflit d'isolation.
+enum KerberosDiagnosticRunner {
+
+    static func runAll(domain: String, server: String) -> [DiagnosticEntry] {
+        var allEntries: [DiagnosticEntry] = []
+
+        allEntries += diagnoseSystem()
+        allEntries += diagnoseEnvironment()
+        allEntries += diagnoseKerberosConfig()
+        allEntries += diagnoseKerberosTickets()
+
+        if !domain.isEmpty {
+            allEntries += diagnoseDNS(domain: domain)
+        }
+
+        if !server.isEmpty {
+            allEntries += diagnoseNetwork(server: server, domain: domain)
+        } else if !domain.isEmpty {
+            allEntries += diagnoseNetwork(server: "", domain: domain)
+        }
+
+        if !domain.isEmpty {
+            allEntries += diagnoseLDAP(domain: domain, server: server)
+        }
+
+        return allEntries
     }
 
     // MARK: - Diagnostic système

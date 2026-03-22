@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Vue de diagnostic Kerberos / AD
 
@@ -229,7 +230,7 @@ struct KerberosDiagnosticView: View {
         let report = diagnosticService.exportReport()
 
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
+        panel.allowedContentTypes = [UTType.plainText]
         panel.nameFieldStringValue = "DSAMAC_diagnostic_\(formattedDate()).txt"
         panel.title = "Exporter le rapport de diagnostic"
 
