@@ -43,25 +43,49 @@ enum ADConnectionMethod: String, CaseIterable, Identifiable {
 // MARK: - Configuration LDAP enrichie
 
 struct ADConnectionConfig {
-    // Connexion
+    // ── Connexion ────────────────────────────────────────────────────────
     var server: String
     var port: Int
     var domain: String
     var method: ADConnectionMethod
 
-    // Credentials (non utilisés en mode Kerberos)
+    // ── Credentials (non utilisés en mode Kerberos) ─────────────────────
     var username: String
     var password: String
 
-    // Options TLS (LDAPS / StartTLS)
+    // ── Options TLS (LDAPS / StartTLS) ──────────────────────────────────
     /// Ignorer les erreurs de certificat (auto-signé, etc.) – à n'activer qu'en dev/test
     var ignoreCertificateErrors: Bool
     /// Chemin vers un certificat CA personnalisé (PEM) – optionnel
     var caCertificatePath: String?
 
-    // Kerberos
+    // ── Kerberos / GSSAPI ───────────────────────────────────────────────
     /// Principal Kerberos explicite (ex: admin@EXAMPLE.LOCAL) – optionnel, sinon ticket courant
     var kerberosPrincipal: String?
+    /// Realm Kerberos (ex: EXAMPLE.LOCAL) – en majuscules, déduit du domaine si vide
+    var kerberosRealm: String?
+    /// Chemin vers un keytab personnalisé (ex: /etc/krb5.keytab) – optionnel
+    var keytabPath: String?
+
+    // ── Recherche LDAP ──────────────────────────────────────────────────
+    /// Base DN de recherche (ex: DC=example,DC=local) – déduit du domaine si vide
+    var searchBaseDN: String?
+    /// Utiliser le Global Catalog (port 3268/3269) pour les recherches inter-domaines
+    var useGlobalCatalog: Bool
+    /// Port Global Catalog personnalisé (3268 pour LDAP, 3269 pour LDAPS)
+    var globalCatalogPort: Int?
+    /// Timeout de connexion en secondes (0 = valeur par défaut du système)
+    var connectionTimeout: Int
+    /// Nombre maximum de résultats retournés (0 = pas de limite)
+    var sizeLimit: Int
+    /// Suivre les referrals LDAP (redirection vers d'autres DC)
+    var followReferrals: Bool
+    /// Tenter l'auto-détection du serveur via DNS SRV (_ldap._tcp.<domain>)
+    var autoDetectServer: Bool
+
+    // ── Paging LDAP ─────────────────────────────────────────────────────
+    /// Taille de page pour le contrôle de paging LDAP (0 = pas de paging)
+    var pageSize: Int
 
     init(
         server: String,
@@ -72,7 +96,17 @@ struct ADConnectionConfig {
         port: Int? = nil,
         ignoreCertificateErrors: Bool = false,
         caCertificatePath: String? = nil,
-        kerberosPrincipal: String? = nil
+        kerberosPrincipal: String? = nil,
+        kerberosRealm: String? = nil,
+        keytabPath: String? = nil,
+        searchBaseDN: String? = nil,
+        useGlobalCatalog: Bool = false,
+        globalCatalogPort: Int? = nil,
+        connectionTimeout: Int = 30,
+        sizeLimit: Int = 0,
+        followReferrals: Bool = true,
+        autoDetectServer: Bool = false,
+        pageSize: Int = 1000
     ) {
         self.server = server
         self.domain = domain
@@ -83,6 +117,45 @@ struct ADConnectionConfig {
         self.ignoreCertificateErrors = ignoreCertificateErrors
         self.caCertificatePath = caCertificatePath
         self.kerberosPrincipal = kerberosPrincipal
+        self.kerberosRealm = kerberosRealm
+        self.keytabPath = keytabPath
+        self.searchBaseDN = searchBaseDN
+        self.useGlobalCatalog = useGlobalCatalog
+        self.globalCatalogPort = globalCatalogPort
+        self.connectionTimeout = connectionTimeout
+        self.sizeLimit = sizeLimit
+        self.followReferrals = followReferrals
+        self.autoDetectServer = autoDetectServer
+        self.pageSize = pageSize
+    }
+
+    // MARK: - Computed helpers
+
+    /// Retourne le Base DN effectif : soit la valeur saisie, soit le DN déduit du domaine
+    var effectiveBaseDN: String {
+        if let dn = searchBaseDN, !dn.isEmpty { return dn }
+        return domain.split(separator: ".").map { "DC=\($0)" }.joined(separator: ",")
+    }
+
+    /// Retourne le realm Kerberos effectif : soit la valeur saisie, soit le domaine en majuscules
+    var effectiveRealm: String {
+        if let realm = kerberosRealm, !realm.isEmpty { return realm }
+        return domain.uppercased()
+    }
+
+    /// Retourne le port effectif en tenant compte du Global Catalog
+    var effectivePort: Int {
+        if useGlobalCatalog {
+            if let gcPort = globalCatalogPort, gcPort > 0 { return gcPort }
+            return method == .ldaps ? 3269 : 3268
+        }
+        return port
+    }
+
+    /// Retourne l'URI LDAP complète
+    var ldapURI: String {
+        let scheme = (method == .ldaps) ? "ldaps" : "ldap"
+        return "\(scheme)://\(server):\(effectivePort)"
     }
 }
 
@@ -723,11 +796,24 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
     // MARK: - Chargement via configuration AD (LDAPS / StartTLS / Kerberos / SimpleBind)
 
     private func loadViaADConfig(_ cfg: ADConnectionConfig) throws {
-        let baseDN = domainToBaseDN(cfg.domain)
+        // Utiliser le Base DN effectif (saisi par l'utilisateur ou déduit du domaine)
+        let baseDN = cfg.effectiveBaseDN
+
+        // Si l'auto-détection DNS SRV est activée et que le serveur est vide, tenter de résoudre
+        var effectiveCfg = cfg
+        if cfg.autoDetectServer && cfg.server.isEmpty {
+            if let detectedServer = try? detectServerViaDNS(domain: cfg.domain) {
+                effectiveCfg.server = detectedServer
+            } else {
+                throw NSError(domain: "AD", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "Auto-détection DNS SRV impossible. Aucun enregistrement _ldap._tcp.\(cfg.domain) trouvé. Saisissez le serveur manuellement."
+                ])
+            }
+        }
 
         // Créer les OUs virtuelles racine
         rootOUID = UUID()
-        let rootOU = OUDescriptor(id: rootOUID, name: cfg.domain, parentID: nil,
+        let rootOU = OUDescriptor(id: rootOUID, name: effectiveCfg.domain, parentID: nil,
                                   distinguishedName: baseDN, description: "Domaine Active Directory",
                                   whenCreated: nil, whenChanged: nil)
 
@@ -747,13 +833,13 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
                                        whenCreated: nil, whenChanged: nil)
 
         // Charger les vraies OUs depuis LDAP
-        let realOUs = (try? ldapFetchOUs(config: cfg, baseDN: baseDN, parentID: rootOUID)) ?? []
+        let realOUs = (try? ldapFetchOUs(config: effectiveCfg, baseDN: baseDN, parentID: rootOUID)) ?? []
         cachedOUs = [rootOU, usersOU, groupsOU, computersOU] + realOUs
 
         // Charger les objets
-        cachedUsers     = try ldapFetchUsers(config: cfg, baseDN: baseDN, ouID: usersOUID)
-        cachedGroups    = try ldapFetchGroups(config: cfg, baseDN: baseDN, ouID: groupsOUID)
-        cachedComputers = try ldapFetchComputers(config: cfg, baseDN: baseDN, ouID: computersOUID)
+        cachedUsers     = try ldapFetchUsers(config: effectiveCfg, baseDN: baseDN, ouID: usersOUID)
+        cachedGroups    = try ldapFetchGroups(config: effectiveCfg, baseDN: baseDN, ouID: groupsOUID)
+        cachedComputers = try ldapFetchComputers(config: effectiveCfg, baseDN: baseDN, ouID: computersOUID)
     }
 
     // Rétrocompat : ancienne méthode appelée via l'ancien LDAPConfig
@@ -771,6 +857,93 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         return domain.split(separator: ".")
             .map { "DC=\($0)" }
             .joined(separator: ",")
+    }
+
+    // MARK: - Auto-détection DNS SRV
+
+    /// Tente de résoudre le serveur LDAP via les enregistrements DNS SRV (_ldap._tcp.<domain>)
+    /// C'est le mécanisme standard utilisé par les clients Windows pour découvrir les DC.
+    private func detectServerViaDNS(domain: String) throws -> String {
+        // Utilise `dig` pour interroger les enregistrements SRV
+        let output = try runProcess("/usr/bin/dig", arguments: [
+            "+short", "SRV", "_ldap._tcp.\(domain)"
+        ])
+
+        // Format: "0 100 389 dc01.example.local."
+        // On prend le premier résultat trié par priorité/poids
+        let lines = output.split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for line in lines {
+            let parts = line.split(separator: " ")
+            if parts.count >= 4 {
+                var server = String(parts[3])
+                // Retirer le point final du FQDN
+                if server.hasSuffix(".") {
+                    server = String(server.dropLast())
+                }
+                return server
+            }
+        }
+
+        throw NSError(domain: "DNS", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Aucun enregistrement DNS SRV trouvé pour _ldap._tcp.\(domain)"
+        ])
+    }
+
+    // MARK: - Vérification du ticket Kerberos
+
+    /// Vérifie qu'un ticket Kerberos valide existe dans le cache.
+    /// Retourne le principal du ticket courant, ou nil si aucun ticket valide n'est trouvé.
+    static func checkKerberosTicket() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/klist")
+        process.arguments = ["-s"]  // -s = mode silencieux, code retour seulement
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else { return nil }
+
+        // Récupérer le principal avec klist (mode verbose)
+        let detailProcess = Process()
+        detailProcess.executableURL = URL(fileURLWithPath: "/usr/bin/klist")
+        let detailOut = Pipe()
+        detailProcess.standardOutput = detailOut
+        detailProcess.standardError = Pipe()
+
+        do {
+            try detailProcess.run()
+            detailProcess.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        let data = detailOut.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+
+        // Chercher la ligne "Default principal: user@REALM"
+        for line in output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("default principal:") {
+                let principal = trimmed
+                    .replacingOccurrences(of: "Default principal:", with: "", options: .caseInsensitive)
+                    .trimmingCharacters(in: .whitespaces)
+                return principal.isEmpty ? nil : principal
+            }
+        }
+
+        return nil
     }
 
     // MARK: - Fetch OUs via LDAP
@@ -992,14 +1165,8 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
 
         var args: [String] = []
 
-        // ── URL de connexion ──────────────────────────────────────────────────
-        let port = config.port
-        switch config.method {
-        case .ldaps:
-            args += ["-H", "ldaps://\(config.server):\(port)"]
-        case .startTLS, .simpleBind, .kerberos:
-            args += ["-H", "ldap://\(config.server):\(port)"]
-        }
+        // ── URL de connexion (tient compte du Global Catalog) ───────────────
+        args += ["-H", config.ldapURI]
 
         // ── Gestion des certificats TLS ───────────────────────────────────────
         // ldapsearch utilise les variables d'environnement LDAPTLS_* ou le fichier ldaprc
@@ -1018,6 +1185,8 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
             if let principal = config.kerberosPrincipal, !principal.isEmpty {
                 args += ["-U", principal]
             }
+            // Mode non-interactif (pas de prompt SASL)
+            args += ["-Q"]
 
         case .ldaps, .startTLS:
             // Simple Bind mais sur canal chiffré → acceptable
@@ -1034,9 +1203,32 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
             args += ["-x", "-D", bindDN, "-w", config.password]
         }
 
+        // ── Timeout de connexion ────────────────────────────────────────────
+        if config.connectionTimeout > 0 {
+            args += ["-o", "nettimeout=\(config.connectionTimeout)"]
+        }
+
+        // ── Limite de résultats ─────────────────────────────────────────────
+        if config.sizeLimit > 0 {
+            args += ["-z", "\(config.sizeLimit)"]
+        }
+
+        // ── Suivi des referrals ─────────────────────────────────────────────
+        if !config.followReferrals {
+            // Désactiver le suivi automatique des referrals LDAP
+            args += ["-o", "ldif-wrap=no"]
+        }
+
+        // ── Paging LDAP (Simple Paged Results Control) ─────────────────────
+        if config.pageSize > 0 {
+            args += ["-E", "pr=\(config.pageSize)/noprompt"]
+        }
+
         // ── Requête LDAP ──────────────────────────────────────────────────────
+        // Utiliser le base DN effectif (fourni par l'appelant ou la config)
+        let effectiveBase = config.searchBaseDN?.isEmpty == false ? config.effectiveBaseDN : baseDN
         args += [
-            "-b", baseDN,
+            "-b", effectiveBase,
             "-LLL",             // LDIF v1 sans commentaires
             "-o", "ldif-wrap=no",  // pas de retour à la ligne dans les valeurs
             filter
@@ -1047,11 +1239,11 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         return parseLDIF(output)
     }
 
-    /// Lance /usr/bin/ldapsearch avec les bonnes variables d'environnement TLS
+    /// Lance /usr/bin/ldapsearch avec les bonnes variables d'environnement TLS et Kerberos
     private func runLDAPProcess(config: ADConnectionConfig, arguments: [String]) throws -> String {
         var env = ProcessInfo.processInfo.environment
 
-        // Variables d'environnement OpenLDAP pour la gestion des certificats
+        // ── Variables d'environnement OpenLDAP pour les certificats TLS ─────
         if config.ignoreCertificateErrors {
             // Désactiver la vérification du certificat serveur (dev/test uniquement)
             env["LDAPTLS_REQCERT"] = "never"
@@ -1062,6 +1254,24 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
         } else {
             // Comportement par défaut : vérification stricte
             env["LDAPTLS_REQCERT"] = "demand"
+        }
+
+        // ── Variables Kerberos ──────────────────────────────────────────────
+        if config.method == .kerberos {
+            // Définir le realm Kerberos dans l'environnement
+            let realm = config.effectiveRealm
+            env["KRB5_DEFAULT_REALM"] = realm
+
+            // Si un keytab est spécifié, le passer via la variable d'environnement
+            if let keytab = config.keytabPath, !keytab.isEmpty {
+                env["KRB5_CLIENT_KTNAME"] = keytab
+                env["KRB5_KTNAME"] = keytab
+            }
+        }
+
+        // ── Désactiver le suivi de referrals si demandé ────────────────────
+        if !config.followReferrals {
+            env["LDAP_OPT_REFERRALS"] = "off"
         }
 
         let process = Process()
@@ -1086,13 +1296,25 @@ final class ActiveDirectoryConnector: DirectoryConnector, ObservableObject {
             // Analyser le message d'erreur pour donner un retour précis
             let msg: String
             if err.contains("Can't contact LDAP server") {
-                msg = "Impossible de contacter le serveur \(config.server):\(config.port). Vérifiez l'adresse et le port."
+                msg = "Impossible de contacter le serveur \(config.server):\(config.effectivePort). Vérifiez l'adresse et le port."
             } else if err.contains("Invalid credentials") {
                 msg = "Identifiants incorrects. Vérifiez le nom d'utilisateur et le mot de passe."
             } else if err.contains("certificate") || err.contains("TLS") {
                 msg = "Erreur de certificat TLS. Activez 'Ignorer les erreurs de certificat' pour un serveur avec certificat auto-signé."
-            } else if err.contains("GSSAPI") || err.contains("Kerberos") {
-                msg = "Erreur Kerberos/GSSAPI. Vérifiez que vous avez un ticket Kerberos valide (kinit)."
+            } else if err.contains("GSSAPI") || err.contains("Kerberos") || err.contains("GSS") {
+                if err.contains("No credentials cache") || err.contains("No Kerberos credentials") {
+                    msg = "Aucun ticket Kerberos trouvé. Exécutez « kinit utilisateur@\(config.effectiveRealm) » dans le Terminal."
+                } else if err.contains("Clock skew") {
+                    msg = "Décalage d'horloge détecté entre ce Mac et le contrôleur de domaine. Synchronisez l'heure (NTP)."
+                } else if err.contains("Server not found in Kerberos database") {
+                    msg = "Le serveur \(config.server) est introuvable dans la base Kerberos. Vérifiez le realm (\(config.effectiveRealm)) et le FQDN du serveur."
+                } else {
+                    msg = "Erreur Kerberos/GSSAPI : \(err.trimmingCharacters(in: .whitespacesAndNewlines))"
+                }
+            } else if err.contains("Referral") {
+                msg = "Le serveur a retourné un referral LDAP. Désactivez le suivi de referrals ou utilisez le Global Catalog (port 3268)."
+            } else if err.contains("Size limit exceeded") {
+                msg = "Limite de résultats atteinte. Augmentez la limite ou utilisez un filtre plus restrictif."
             } else {
                 msg = err.isEmpty ? "ldapsearch a échoué (code \(process.terminationStatus))" : err
             }
