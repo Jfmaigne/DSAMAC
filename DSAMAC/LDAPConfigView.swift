@@ -1,364 +1,364 @@
-    import SwiftUI
+import SwiftUI
 
 struct LDAPConfigView: View {
-    @ObservedObject var connector: ActiveDirectoryConnector
-    /// Le service de domaine, pour recharger l'arbre après connexion réussie
-    @ObservedObject var domainService: DirectoryDomainService
+@ObservedObject var connector: ActiveDirectoryConnector
+/// Le service de domaine, pour recharger l'arbre après connexion réussie
+@ObservedObject var domainService: DirectoryDomainService
 
-    // ── Champs de connexion ─────────────────────────────────────────────
-    @State private var server: String = ""
-    @State private var domain: String = ""
-    @State private var port: String = ""
-    @State private var method: ADConnectionMethod = .kerberos
-    @State private var username: String = ""
-    @State private var password: String = ""
+// ── Champs de connexion ─────────────────────────────────────────────
+@State private var server: String = ""
+@State private var domain: String = ""
+@State private var port: String = ""
+@State private var method: ADConnectionMethod = .kerberos
+@State private var username: String = ""
+@State private var password: String = ""
 
-    // ── Options TLS ─────────────────────────────────────────────────────
-    @State private var ignoreCertErrors: Bool = false
-    @State private var caCertPath: String = ""
+// ── Options TLS ─────────────────────────────────────────────────────
+@State private var ignoreCertErrors: Bool = false
+@State private var caCertPath: String = ""
 
-    // ── Kerberos / GSSAPI ───────────────────────────────────────────────
-    @State private var kerberosPrincipal: String = ""
-    @State private var kerberosRealm: String = ""
-    @State private var keytabPath: String = ""
-    @State private var kerberosTicketPrincipal: String? = nil
+// ── Kerberos / GSSAPI ───────────────────────────────────────────────
+@State private var kerberosPrincipal: String = ""
+@State private var kerberosRealm: String = ""
+@State private var keytabPath: String = ""
+@State private var kerberosTicketPrincipal: String? = nil
 
-    // ── Recherche LDAP ──────────────────────────────────────────────────
-    @State private var searchBaseDN: String = ""
-    @State private var useGlobalCatalog: Bool = false
-    @State private var globalCatalogPort: String = ""
+// ── Recherche LDAP ──────────────────────────────────────────────────
+@State private var searchBaseDN: String = ""
+@State private var useGlobalCatalog: Bool = false
+@State private var globalCatalogPort: String = ""
 
-    // ── Options avancées ────────────────────────────────────────────────
-    @State private var autoDetectServer: Bool = true
-    @State private var connectionTimeout: String = "30"
-    @State private var sizeLimit: String = "0"
-    @State private var followReferrals: Bool = true
-    @State private var pageSize: String = "1000"
+// ── Options avancées ────────────────────────────────────────────────
+@State private var autoDetectServer: Bool = true
+@State private var connectionTimeout: String = "30"
+@State private var sizeLimit: String = "0"
+@State private var followReferrals: Bool = true
+@State private var pageSize: String = "1000"
 
-    // ── État de l'interface ─────────────────────────────────────────────
-    @State private var isConnecting: Bool = false
-    @State private var errorMessage: String?
-    @State private var showAdvanced: Bool = false
-    @State private var showKerberosAdvanced: Bool = false
-    @State private var showLDAPAdvanced: Bool = false
-    @State private var showDiagnostic: Bool = false
+// ── État de l'interface ─────────────────────────────────────────────
+@State private var isConnecting: Bool = false
+@State private var errorMessage: String?
+@State private var showAdvanced: Bool = false
+@State private var showKerberosAdvanced: Bool = false
+@State private var showLDAPAdvanced: Bool = false
+@State private var showDiagnostic: Bool = false
 
-    var body: some View {
-        VStack(spacing: 0) {
+var body: some View {
+    VStack(spacing: 0) {
 
-            // ── En-tête ───────────────────────────────────────────────────────
-            HStack(spacing: 12) {
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 32))
-                    .foregroundStyle(.blue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Connexion au domaine Active Directory")
-                        .font(.title2).bold()
-                    Text("Configurez les paramètres de connexion à votre domaine AD")
-                        .font(.subheadline)
+        // ── En-tête ───────────────────────────────────────────────────────
+        HStack(spacing: 12) {
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 32))
+                .foregroundStyle(.blue)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Connexion au domaine Active Directory")
+                    .font(.title2).bold()
+                Text("Configurez les paramètres de connexion à votre domaine AD")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding()
+        .background(.regularMaterial)
+
+        Divider()
+
+        // ── Formulaire ────────────────────────────────────────────────────
+        Form {
+
+            // ═══════════════════════════════════════════════════════════════
+            // Section méthode de connexion
+            // ═══════════════════════════════════════════════════════════════
+            Section {
+                Picker("Méthode", selection: $method) {
+                    ForEach(ADConnectionMethod.allCases) { m in
+                        Text(m.rawValue).tag(m)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: method) { _, newMethod in
+                    let currentPort = Int(port) ?? 0
+                    let oldDefaults = ADConnectionMethod.allCases.map { $0.defaultPort }
+                    if oldDefaults.contains(currentPort) || port.isEmpty {
+                        port = "\(newMethod.defaultPort)"
+                    }
+                    // En mode Kerberos, activer l'auto-détection par défaut
+                    if newMethod == .kerberos && server.isEmpty {
+                        autoDetectServer = true
+                    }
+                }
+
+                // Badge de sécurité
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: securityIcon)
+                        .foregroundStyle(securityColor)
+                    Text(method.securityDescription)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Spacer()
+                .padding(.vertical, 4)
+
+            } header: {
+                Text("Méthode de connexion")
             }
-            .padding()
-            .background(.regularMaterial)
 
-            Divider()
+            // ═══════════════════════════════════════════════════════════════
+            // Section serveur & domaine
+            // ═══════════════════════════════════════════════════════════════
+            Section {
+                // Auto-détection DNS SRV
+                Toggle("Auto-détecter le serveur (DNS SRV)", isOn: $autoDetectServer)
 
-            // ── Formulaire ────────────────────────────────────────────────────
-            Form {
-
-                // ═══════════════════════════════════════════════════════════════
-                // Section méthode de connexion
-                // ═══════════════════════════════════════════════════════════════
-                Section {
-                    Picker("Méthode", selection: $method) {
-                        ForEach(ADConnectionMethod.allCases) { m in
-                            Text(m.rawValue).tag(m)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .onChange(of: method) { _, newMethod in
-                        let currentPort = Int(port) ?? 0
-                        let oldDefaults = ADConnectionMethod.allCases.map { $0.defaultPort }
-                        if oldDefaults.contains(currentPort) || port.isEmpty {
-                            port = "\(newMethod.defaultPort)"
-                        }
-                        // En mode Kerberos, activer l'auto-détection par défaut
-                        if newMethod == .kerberos && server.isEmpty {
-                            autoDetectServer = true
-                        }
-                    }
-
-                    // Badge de sécurité
+                if autoDetectServer {
                     HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: securityIcon)
-                            .foregroundStyle(securityColor)
-                        Text(method.securityDescription)
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .foregroundStyle(.blue)
+                        Text("Le contrôleur de domaine sera détecté automatiquement via l'enregistrement DNS _ldap._tcp.\(domain.isEmpty ? "<domaine>" : domain)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    .padding(.vertical, 4)
-
-                } header: {
-                    Text("Méthode de connexion")
+                    .padding(.vertical, 2)
                 }
 
-                // ═══════════════════════════════════════════════════════════════
-                // Section serveur & domaine
-                // ═══════════════════════════════════════════════════════════════
-                Section {
-                    // Auto-détection DNS SRV
-                    Toggle("Auto-détecter le serveur (DNS SRV)", isOn: $autoDetectServer)
+                if !autoDetectServer {
+                    TextField("Serveur AD (ex: dc01.example.local)", text: $server)
+                        .textContentType(.URL)
+                }
 
-                    if autoDetectServer {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "antenna.radiowaves.left.and.right")
-                                .foregroundStyle(.blue)
-                            Text("Le contrôleur de domaine sera détecté automatiquement via l'enregistrement DNS _ldap._tcp.\(domain.isEmpty ? "<domaine>" : domain)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                HStack {
+                    TextField("Nom de domaine (ex: example.local)", text: $domain)
+                        .onChange(of: domain) { _, newDomain in
+                            // Auto-remplir le realm Kerberos
+                            if kerberosRealm.isEmpty || kerberosRealm == kerberosRealm.uppercased() {
+                                kerberosRealm = newDomain.uppercased()
+                            }
+                            // Auto-remplir le Base DN
+                            if searchBaseDN.isEmpty {
+                                // On ne force pas, l'utilisateur peut le saisir manuellement
+                            }
                         }
-                        .padding(.vertical, 2)
+                    if !useGlobalCatalog {
+                        TextField("Port", text: $port)
+                            .frame(width: 70)
+                            .onAppear {
+                                if port.isEmpty { port = "\(method.defaultPort)" }
+                            }
                     }
+                }
 
-                    if !autoDetectServer {
-                        TextField("Serveur AD (ex: dc01.example.local)", text: $server)
-                            .textContentType(.URL)
-                    }
-
-                    HStack {
-                        TextField("Nom de domaine (ex: example.local)", text: $domain)
-                            .onChange(of: domain) { _, newDomain in
-                                // Auto-remplir le realm Kerberos
-                                if kerberosRealm.isEmpty || kerberosRealm == kerberosRealm.uppercased() {
-                                    kerberosRealm = newDomain.uppercased()
-                                }
-                                // Auto-remplir le Base DN
-                                if searchBaseDN.isEmpty {
-                                    // On ne force pas, l'utilisateur peut le saisir manuellement
+                // Global Catalog
+                Toggle("Utiliser le Global Catalog (inter-domaines)", isOn: $useGlobalCatalog)
+                if useGlobalCatalog {
+                    HStack(spacing: 8) {
+                        Image(systemName: "globe")
+                            .foregroundStyle(.blue)
+                        Text("Port \(method == .ldaps ? "3269 (LDAPS)" : "3268 (LDAP)") – Recherche dans toute la forêt AD")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        TextField("Port GC", text: $globalCatalogPort)
+                            .frame(width: 70)
+                            .onAppear {
+                                if globalCatalogPort.isEmpty {
+                                    globalCatalogPort = method == .ldaps ? "3269" : "3268"
                                 }
                             }
-                        if !useGlobalCatalog {
-                            TextField("Port", text: $port)
-                                .frame(width: 70)
-                                .onAppear {
-                                    if port.isEmpty { port = "\(method.defaultPort)" }
-                                }
-                        }
                     }
-
-                    // Global Catalog
-                    Toggle("Utiliser le Global Catalog (inter-domaines)", isOn: $useGlobalCatalog)
-                    if useGlobalCatalog {
-                        HStack(spacing: 8) {
-                            Image(systemName: "globe")
-                                .foregroundStyle(.blue)
-                            Text("Port \(method == .ldaps ? "3269 (LDAPS)" : "3268 (LDAP)") – Recherche dans toute la forêt AD")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            TextField("Port GC", text: $globalCatalogPort)
-                                .frame(width: 70)
-                                .onAppear {
-                                    if globalCatalogPort.isEmpty {
-                                        globalCatalogPort = method == .ldaps ? "3269" : "3268"
-                                    }
-                                }
-                        }
-                    }
-                } header: {
-                    Text("Serveur")
                 }
+            } header: {
+                Text("Serveur")
+            }
 
-                // ═══════════════════════════════════════════════════════════════
-                // Section Base DN de recherche
-                // ═══════════════════════════════════════════════════════════════
-                Section {
-                    TextField("Base DN (ex: DC=example,DC=local)", text: $searchBaseDN)
-                        .font(.system(.body, design: .monospaced))
+            // ═══════════════════════════════════════════════════════════════
+            // Section Base DN de recherche
+            // ═══════════════════════════════════════════════════════════════
+            Section {
+                TextField("Base DN (ex: DC=example,DC=local)", text: $searchBaseDN)
+                    .font(.system(.body, design: .monospaced))
 
-                    if searchBaseDN.isEmpty && !domain.isEmpty {
-                        HStack(spacing: 6) {
-                            Image(systemName: "info.circle")
-                                .foregroundStyle(.blue)
-                            Text("Valeur déduite : \(domain.split(separator: ".").map { "DC=\($0)" }.joined(separator: ","))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
+                if searchBaseDN.isEmpty && !domain.isEmpty {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(.blue)
+                        Text("Valeur déduite : \(domain.split(separator: ".").map { "DC=\($0)" }.joined(separator: ","))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
+                }
+            } header: {
+                Text("Base de recherche LDAP")
+            } footer: {
+                Text("Laissez vide pour déduire automatiquement du nom de domaine. Saisissez un DN spécifique pour limiter la recherche à une branche de l'arbre (ex: OU=Paris,DC=example,DC=local).")
+                    .font(.caption2)
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // Section credentials (masquée pour Kerberos)
+            // ═══════════════════════════════════════════════════════════════
+            if method != .kerberos {
+                Section {
+                    TextField("Nom d'utilisateur (ex: admin@example.local)", text: $username)
+                        .textContentType(.username)
+                    SecureField("Mot de passe", text: $password)
+                        .textContentType(.password)
                 } header: {
-                    Text("Base de recherche LDAP")
+                    Text("Identifiants")
                 } footer: {
-                    Text("Laissez vide pour déduire automatiquement du nom de domaine. Saisissez un DN spécifique pour limiter la recherche à une branche de l'arbre (ex: OU=Paris,DC=example,DC=local).")
-                        .font(.caption2)
-                }
-
-                // ═══════════════════════════════════════════════════════════════
-                // Section credentials (masquée pour Kerberos)
-                // ═══════════════════════════════════════════════════════════════
-                if method != .kerberos {
-                    Section {
-                        TextField("Nom d'utilisateur (ex: admin@example.local)", text: $username)
-                            .textContentType(.username)
-                        SecureField("Mot de passe", text: $password)
-                            .textContentType(.password)
-                    } header: {
-                        Text("Identifiants")
-                    } footer: {
-                        if method == .simpleBind {
-                            Label("Le mot de passe sera transmis en clair sur le réseau.", systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                                .font(.caption)
-                        }
+                    if method == .simpleBind {
+                        Label("Le mot de passe sera transmis en clair sur le réseau.", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption)
                     }
-                } else {
-                    // ═══════════════════════════════════════════════════════════
-                    // Section Kerberos / GSSAPI
-                    // ═══════════════════════════════════════════════════════════
-                    Section {
-                        // Statut du ticket Kerberos
-                        HStack(spacing: 10) {
-                            if let principal = kerberosTicketPrincipal {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Ticket Kerberos valide")
-                                        .font(.callout).fontWeight(.medium)
-                                    Text(principal)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            } else {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.orange)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Aucun ticket Kerberos détecté")
-                                        .font(.callout).fontWeight(.medium)
-                                    Text("Exécutez « kinit utilisateur@DOMAINE » dans le Terminal")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
+                }
+            } else {
+                // ═══════════════════════════════════════════════════════════
+                // Section Kerberos / GSSAPI
+                // ═══════════════════════════════════════════════════════════
+                Section {
+                    // Statut du ticket Kerberos
+                    HStack(spacing: 10) {
+                        if let principal = kerberosTicketPrincipal {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Ticket Kerberos valide")
+                                    .font(.callout).fontWeight(.medium)
+                                Text(principal)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                            Spacer()
-                            Button("Vérifier") {
-                                kerberosTicketPrincipal = ActiveDirectoryConnector.checkKerberosTicket()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-                        .padding(.vertical, 4)
-
-                        TextField("Realm Kerberos (ex: EXAMPLE.LOCAL)", text: $kerberosRealm)
-                            .font(.system(.body, design: .monospaced))
-
-                        if kerberosRealm.isEmpty && !domain.isEmpty {
-                            HStack(spacing: 6) {
-                                Image(systemName: "info.circle")
-                                    .foregroundStyle(.blue)
-                                Text("Valeur déduite : \(domain.uppercased())")
+                        } else {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Aucun ticket Kerberos détecté")
+                                    .font(.callout).fontWeight(.medium)
+                                Text("Exécutez « kinit utilisateur@DOMAINE » dans le Terminal")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
-
-                        // Options Kerberos avancées
-                        DisclosureGroup("Options Kerberos avancées", isExpanded: $showKerberosAdvanced) {
-                            TextField("Principal Kerberos (optionnel, ex: admin@EXAMPLE.LOCAL)", text: $kerberosPrincipal)
-                                .textContentType(.username)
-
-                            TextField("Chemin vers un keytab (optionnel, ex: /etc/krb5.keytab)", text: $keytabPath)
-                                .font(.system(.body, design: .monospaced))
-
-                            if !keytabPath.isEmpty {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "key.fill")
-                                        .foregroundStyle(.blue)
-                                    Text("Le keytab sera utilisé pour l'authentification sans saisie de mot de passe. Utile pour les tâches automatisées.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        // Bouton diagnostic
-                        Button {
-                            showDiagnostic = true
-                        } label: {
-                            Label("Lancer le diagnostic complet…", systemImage: "stethoscope")
+                        Spacer()
+                        Button("Vérifier") {
+                            kerberosTicketPrincipal = ActiveDirectoryConnector.checkKerberosTicket()
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .padding(.top, 4)
-
-                    } header: {
-                        Text("Kerberos / GSSAPI")
-                    } footer: {
-                        Text("Si votre Mac est joint au domaine, le ticket Kerberos courant sera utilisé automatiquement. Sinon, exécutez « kinit utilisateur@\(kerberosRealm.isEmpty ? "DOMAINE" : kerberosRealm) » dans le Terminal au préalable.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
                     }
-                }
+                    .padding(.vertical, 4)
 
-                // ═══════════════════════════════════════════════════════════════
-                // Options TLS avancées (certificats)
-                // ═══════════════════════════════════════════════════════════════
-                if method == .ldaps || method == .startTLS {
-                    Section {
-                        DisclosureGroup("Options TLS avancées", isExpanded: $showAdvanced) {
-                            Toggle("Ignorer les erreurs de certificat", isOn: $ignoreCertErrors)
-                            if ignoreCertErrors {
-                                Label("À n'utiliser qu'en développement/test (certificat auto-signé).", systemImage: "exclamationmark.shield.fill")
-                                    .foregroundStyle(.orange)
-                                    .font(.caption)
-                            }
-                            TextField("Chemin vers un CA personnalisé (PEM) – optionnel", text: $caCertPath)
-                                .font(.system(.body, design: .monospaced))
+                    TextField("Realm Kerberos (ex: EXAMPLE.LOCAL)", text: $kerberosRealm)
+                        .font(.system(.body, design: .monospaced))
+
+                    if kerberosRealm.isEmpty && !domain.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "info.circle")
+                                .foregroundStyle(.blue)
+                            Text("Valeur déduite : \(domain.uppercased())")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                }
 
-                // ═══════════════════════════════════════════════════════════════
-                // Options LDAP avancées
-                // ═══════════════════════════════════════════════════════════════
-                Section {
-                    DisclosureGroup("Options LDAP avancées", isExpanded: $showLDAPAdvanced) {
-                        HStack {
-                            Text("Timeout de connexion (sec)")
-                            Spacer()
-                            TextField("30", text: $connectionTimeout)
-                                .frame(width: 60)
-                                .multilineTextAlignment(.trailing)
-                        }
+                    // Options Kerberos avancées
+                    DisclosureGroup("Options Kerberos avancées", isExpanded: $showKerberosAdvanced) {
+                        TextField("Principal Kerberos (optionnel, ex: admin@EXAMPLE.LOCAL)", text: $kerberosPrincipal)
+                            .textContentType(.username)
 
-                        HStack {
-                            Text("Limite de résultats")
-                            Spacer()
-                            TextField("0 = illimité", text: $sizeLimit)
-                                .frame(width: 80)
-                                .multilineTextAlignment(.trailing)
-                        }
+                        TextField("Chemin vers un keytab (optionnel, ex: /etc/krb5.keytab)", text: $keytabPath)
+                            .font(.system(.body, design: .monospaced))
 
-                        HStack {
-                            Text("Taille de page (paging)")
-                            Spacer()
-                            TextField("1000", text: $pageSize)
-                                .frame(width: 80)
-                                .multilineTextAlignment(.trailing)
-                        }
-
-                        Toggle("Suivre les referrals LDAP", isOn: $followReferrals)
-                        if !followReferrals {
+                        if !keytabPath.isEmpty {
                             HStack(spacing: 6) {
-                                Image(systemName: "info.circle")
+                                Image(systemName: "key.fill")
                                     .foregroundStyle(.blue)
-                                Text("Désactiver si vous recevez des erreurs de referral. Utilisez plutôt le Global Catalog pour les recherches inter-domaines.")
+                                Text("Le keytab sera utilisé pour l'authentification sans saisie de mot de passe. Utile pour les tâches automatisées.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
                     }
+
+                    // Bouton diagnostic
+                    Button {
+                        showDiagnostic = true
+                    } label: {
+                        Label("Lancer le diagnostic complet…", systemImage: "stethoscope")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .padding(.top, 4)
+
+                } header: {
+                    Text("Kerberos / GSSAPI")
+                } footer: {
+                    Text("Si votre Mac est joint au domaine, le ticket Kerberos courant sera utilisé automatiquement. Sinon, exécutez « kinit utilisateur@\(kerberosRealm.isEmpty ? "DOMAINE" : kerberosRealm) » dans le Terminal au préalable.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // Options TLS avancées (certificats)
+            // ═══════════════════════════════════════════════════════════════
+            if method == .ldaps || method == .startTLS {
+                Section {
+                    DisclosureGroup("Options TLS avancées", isExpanded: $showAdvanced) {
+                        Toggle("Ignorer les erreurs de certificat", isOn: $ignoreCertErrors)
+                        if ignoreCertErrors {
+                            Label("À n'utiliser qu'en développement/test (certificat auto-signé).", systemImage: "exclamationmark.shield.fill")
+                                .foregroundStyle(.orange)
+                                .font(.caption)
+                        }
+                        TextField("Chemin vers un CA personnalisé (PEM) – optionnel", text: $caCertPath)
+                            .font(.system(.body, design: .monospaced))
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // Options LDAP avancées
+            // ═══════════════════════════════════════════════════════════════
+            Section {
+                DisclosureGroup("Options LDAP avancées", isExpanded: $showLDAPAdvanced) {
+                    HStack {
+                        Text("Timeout de connexion (sec)")
+                        Spacer()
+                        TextField("30", text: $connectionTimeout)
+                            .frame(width: 60)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    HStack {
+                        Text("Limite de résultats")
+                        Spacer()
+                        TextField("0 = illimité", text: $sizeLimit)
+                            .frame(width: 80)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    HStack {
+                        Text("Taille de page (paging)")
+                        Spacer()
+                        TextField("1000", text: $pageSize)
+                            .frame(width: 80)
+                            .multilineTextAlignment(.trailing)
+                    }
+
+                    Toggle("Suivre les referrals LDAP", isOn: $followReferrals)
+                    if !followReferrals {
+                        HStack(spacing: 6) {
+                            Image(systemName: "info.circle")
+                                .foregroundStyle(.blue)
+                            Text("Désactiver si vous recevez des erreurs de referral. Utilisez plutôt le Global Catalog pour les recherches inter-domaines.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
 
                 // ═══════════════════════════════════════════════════════════════
                 // Message d'erreur
@@ -375,32 +375,42 @@ struct LDAPConfigView: View {
                         .padding(.vertical, 4)
                     }
                 }
-
-                // ═══════════════════════════════════════════════════════════════
-                // Bouton de connexion (dans le formulaire pour rester visible)
-                // ═══════════════════════════════════════════════════════════════
-                Section {
-                    HStack {
-                        Spacer()
-                        Button(action: connect) {
-                            HStack(spacing: 8) {
-                                if isConnecting {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                }
-                                Text(isConnecting ? "Connexion en cours…" : "Se connecter")
-                                    .fontWeight(.semibold)
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                        .disabled(isConnecting || !isFormValid)
-                        .keyboardShortcut(.return)
-                        Spacer()
-                    }
-                }
             }
             .formStyle(.grouped)
+
+            Divider()
+
+            // ═══════════════════════════════════════════════════════════════
+            // Bouton de connexion (EN DEHORS du Form pour éviter le bug
+            // macOS où .disabled() est ignoré dans un Form .grouped)
+            // ═══════════════════════════════════════════════════════════════
+            HStack {
+                // Indicateur de validation
+                if !isFormValid {
+                    Label(validationHint, systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button(action: connect) {
+                    HStack(spacing: 8) {
+                        if isConnecting {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(isConnecting ? "Connexion en cours…" : "Se connecter")
+                            .fontWeight(.semibold)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(isConnecting || !isFormValid)
+                .keyboardShortcut(.return)
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 12)
         }
         .frame(minWidth: 600, minHeight: 580)
         .onAppear {
@@ -430,6 +440,25 @@ struct LDAPConfigView: View {
         // Pour les autres méthodes, username + password sont obligatoires
         return !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !password.isEmpty
+    }
+
+    /// Indique à l'utilisateur ce qui manque pour activer le bouton
+    private var validationHint: String {
+        if domain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Saisissez le nom de domaine"
+        }
+        if !autoDetectServer && server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Saisissez le serveur ou activez l'auto-détection"
+        }
+        if method != .kerberos {
+            if username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "Saisissez le nom d'utilisateur"
+            }
+            if password.isEmpty {
+                return "Saisissez le mot de passe"
+            }
+        }
+        return ""
     }
 
     private var securityIcon: String {
